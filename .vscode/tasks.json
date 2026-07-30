@@ -1,0 +1,79 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "CCS: Build Smart Monitor (Debug)",
+            "type": "process",
+            "command": "${env:ComSpec}",
+            "args": [
+                "/d",
+                "/c",
+                "C:/ti/ccs2100/ccs/eclipse/ccs-server-cli.bat",
+                "-noSplash",
+                "-workspace",
+                "${workspaceFolder}",
+                "-application",
+                "com.ti.ccs.apps.buildProject",
+                "-ccs.locations",
+                "${workspaceFolder}/Smart Monitor",
+                "-ccs.configuration",
+                "Debug",
+                "-ccs.autoImport",
+                "-ccs.listProblems"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": {
+                "owner": "cpp",
+                "fileLocation": [
+                    "relative",
+                    "${workspaceFolder}/Smart Monitor/Debug"
+                ],
+                "pattern": {
+                    "regexp": "^\\\"(.+)\\\", line ([0-9]+): (error|warning)(?: #[^:]+)?: (.*)$",
+                    "file": 1,
+                    "line": 2,
+                    "severity": 3,
+                    "message": 4
+                }
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "clear": true,
+                "reveal": "always",
+                "panel": "dedicated"
+            }
+        },
+        {
+            "label": "CCS: Clean Smart Monitor (Debug)",
+            "type": "process",
+            "command": "${env:ComSpec}",
+            "args": [
+                "/d",
+                "/c",
+                "C:/ti/ccs2100/ccs/eclipse/ccs-server-cli.bat",
+                "-noSplash",
+                "-workspace",
+                "${workspaceFolder}",
+                "-application",
+                "com.ti.ccs.apps.buildProject",
+                "-ccs.locations",
+                "${workspaceFolder}/Smart Monitor",
+                "-ccs.configuration",
+                "Debug",
+                "-ccs.buildType",
+                "clean",
+                "-ccs.autoImport",
+                "-ccs.listProblems"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "problemMatcher": []
+        }
+    ]
+}

@@ -1,0 +1,43 @@
+# CCStudio generated build directories
+**/Debug/
+**/Release/
+
+# CCStudio/clangd generated indexes and compilation databases
+**/.clangd
+**/.cache/
+
+# Compiler and linker artifacts (including custom build configurations)
+*.obj
+*.o
+*.d
+*.d_raw
+*.out
+*.map
+*.hex
+*.bin
+*.elf
+*.lst
+*.opt
+
+# CCStudio workspace/runtime state
+.metadata/
+.ccs-server/
+*.log
+
+# Local Codex/agent connection state
+.codex/config.toml
+.agents/
+
+# VS Code local databases and caches
+.vscode/*.db
+.vscode/*.db-*
+.vscode/ipch/
+.vscode/.cache/
+
+# Operating-system and editor clutter
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~

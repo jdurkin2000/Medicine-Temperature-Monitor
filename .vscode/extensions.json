@@ -1,0 +1,10 @@
+{
+    "recommendations": [
+        "ms-vscode.cpptools"
+    ],
+    "unwantedRecommendations": [
+        "llvm-vs-code-extensions.vscode-clangd",
+        "kylinideteam.kylin-clangd",
+        "kylinideteam.kylin-cpp-pack"
+    ]
+}

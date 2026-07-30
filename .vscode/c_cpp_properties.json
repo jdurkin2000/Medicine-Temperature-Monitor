@@ -1,0 +1,38 @@
+{
+    "configurations": [
+        {
+            "name": "MSP430FR6989 (TI CCS)",
+            "compilerPath": "",
+            "intelliSenseMode": "windows-gcc-x64",
+            "cStandard": "c11",
+            "cppStandard": "c++17",
+            "includePath": [
+                "${workspaceFolder}/Smart Monitor",
+                "${workspaceFolder}/Smart Monitor/driverlib/MSP430FR5xx_6xx",
+                "C:/ti/ccs2100/ccs/ccs_base/msp430/include",
+                "C:/ti/ccs2100/ccs/tools/compiler/ti-cgt-msp430_21.6.2.LTS/include"
+            ],
+            "defines": [
+                "__MSP430FR6989__",
+                "_MPU_ENABLE",
+                "__MSP430__",
+                "__MSP430X__",
+                "__TI_COMPILER_VERSION__=2106002",
+                "__PTRDIFF_T_TYPE__=int",
+                "__SIZE_T_TYPE__=unsigned int",
+                "__WCHAR_T_TYPE__=int",
+                "__interrupt="
+            ],
+            "browse": {
+                "path": [
+                    "${workspaceFolder}/Smart Monitor",
+                    "${workspaceFolder}/Smart Monitor/driverlib/MSP430FR5xx_6xx",
+                    "C:/ti/ccs2100/ccs/ccs_base/msp430/include",
+                    "C:/ti/ccs2100/ccs/tools/compiler/ti-cgt-msp430_21.6.2.LTS/include"
+                ],
+                "limitSymbolsToIncludedHeaders": true
+            }
+        }
+    ],
+    "version": 4
+}

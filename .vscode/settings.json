@@ -1,0 +1,17 @@
+{
+    "C_Cpp.errorSquiggles": "enabled",
+    "C_Cpp.intelliSenseEngine": "default",
+    "C_Cpp.loggingLevel": "Warning",
+    "files.associations": {
+        "*.h": "c"
+    },
+    "files.exclude": {
+        "**/Debug/.clangd/.cache": true
+    },
+    "files.watcherExclude": {
+        "**/Debug/.clangd/.cache/**": true
+    },
+    "search.exclude": {
+        "**/Debug/.clangd/.cache/**": true
+    }
+}
