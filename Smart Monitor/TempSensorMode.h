@@ -33,8 +33,8 @@
  *
  * TempSensorMode.h
  *
- * Simple thermometer application that uses the internal temperature sensor to
- * measure and display die temperature on the segmented LCD screen
+ * Simple thermometer application that uses a DS18B20 sensor to measure and
+ * display temperature on the segmented LCD screen
  *
  * February 2015
  * E. Chen
@@ -45,10 +45,6 @@
 #define OUTOFBOX_MSP430FR6989_TEMPSENSORMODE_H_
 
 #define TEMPSENSOR_MODE       2
-
-// See device datasheet for TLV table memory mapping
-#define CALADC_12V_30C  *((unsigned int *)0x1A1A)       // Temperature Sensor Calibration-30 C
-#define CALADC_12V_85C  *((unsigned int *)0x1A1C)       // Temperature Sensor Calibration-85 C
 
 extern volatile unsigned char mode;
 extern volatile unsigned char S1buttonDebounce;

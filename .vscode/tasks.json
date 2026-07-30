@@ -74,6 +74,37 @@
                 "cwd": "${workspaceFolder}"
             },
             "problemMatcher": []
+        },
+        {
+            "label": "CCS: Build and Flash Smart Monitor (Debug)",
+            "type": "process",
+            "command": "C:/ti/ccs2100/ccs/ccs_base/DebugServer/bin/DSLite.exe",
+            "args": [
+                "flash",
+                "--config",
+                "${workspaceFolder}/Smart Monitor/targetConfigs/MSP430FR6989.ccxml",
+                "--flash",
+                "--verify",
+                "--run",
+                "--verbose",
+                "${workspaceFolder}/Smart Monitor/Debug/Smart Monitor.out"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "dependsOn": [
+                "CCS: Build Smart Monitor (Debug)"
+            ],
+            "dependsOrder": "sequence",
+            "problemMatcher": [],
+            "presentation": {
+                "clear": true,
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "runOptions": {
+                "instanceLimit": 1
+            }
         }
     ]
 }

@@ -33,8 +33,8 @@
  *
  * TempSensorMode.c
  *
- * Simple thermometer application that uses the internal temperature sensor to
- * measure and display die temperature on the segmented LCD screen
+ * Simple thermometer application that uses a DS18B20 sensor to measure and
+ * display temperature on the segmented LCD screen
  *
  * February 2015
  * E. Chen
@@ -45,159 +45,53 @@
 #include "TempSensorMode.h"
 #include "hal_LCD.h"
 
+#include "ds18b20.h"
+
 volatile unsigned char tempUnit = 0;         // Temperature Unit
-volatile int degC;                       // Celcius measurement
-volatile int degF;                       // Fahrenheit measurement
+volatile int degC;                           // Celsius, in tenths of a degree
+volatile int degF;                           // Fahrenheit, in tenths of a degree
 
-// TimerA UpMode Configuration Parameter
-Timer_A_initUpModeParam initUpParam_A1 =
-{
-    TIMER_A_CLOCKSOURCE_ACLK,               // ACLK Clock Source
-    TIMER_A_CLOCKSOURCE_DIVIDER_1,          // ACLK/1 = 32768Hz
-    0x2000,                                 // Timer period
-    TIMER_A_TAIE_INTERRUPT_DISABLE,         // Disable Timer interrupt
-    TIMER_A_CCIE_CCR0_INTERRUPT_DISABLE ,   // Disable CCR0 interrupt
-    TIMER_A_DO_CLEAR                        // Clear value
-};
+#define TEMPERATURE_UPDATE_INTERVAL_US 1000000UL
 
-Timer_A_initCompareModeParam initCompParam =
+void tempSensor(void)
 {
-    TIMER_A_CAPTURECOMPARE_REGISTER_1,        // Compare register 1
-    TIMER_A_CAPTURECOMPARE_INTERRUPT_DISABLE, // Disable Compare interrupt
-    TIMER_A_OUTPUTMODE_RESET_SET,             // Timer output mode 7
-    0x1000                                    // Compare value
-};
-
-void tempSensor()
-{
-    //Enter LPM3 mode with interrupts enabled
     while(mode == TEMPSENSOR_MODE)
     {
-        __bis_SR_register(LPM3_bits | GIE);                       // LPM3 with interrupts enabled
-        __no_operation();                                         // Only for debugger
+        float temperatureC;
 
-        if (tempSensorRunning)
-        {
-            // Turn LED1 on when waking up to calculate temperature and update display
-            P1OUT |= BIT0;
+        // Turn LED1 on while reading and updating the temperature.
+        P1OUT |= BIT0;
 
-            // Calculate Temperature in degree C and F
-            signed short temp = (ADC12MEM0 - CALADC_12V_30C);
-            degC = ((long)temp * 10 * (85-30) * 10)/((CALADC_12V_85C-CALADC_12V_30C)*10) + 300;
-            degF = (degC) * 9 / 5 + 320;
+        temperatureC = get_temp();
 
-            // Update temperature on LCD
-            displayTemp();
+        // Store both values in tenths of a degree for displayTemp().
+        if (temperatureC >= 0.0f)
+            degC = (int)(temperatureC * 10.0f + 0.5f);
+        else
+            degC = (int)(temperatureC * 10.0f - 0.5f);
 
-            P1OUT &= ~BIT0;
-        }
+        degF = degC * 9 / 5 + 320;
+
+        displayTemp();
+        P1OUT &= ~BIT0;
+
+        // Keep the display responsive without continuously polling the sensor.
+        delay_us(TEMPERATURE_UPDATE_INTERVAL_US);
     }
 }
 
-void tempSensorModeInit()
+void tempSensorModeInit(void)
 {
-    tempSensorRunning = 1;
-
     displayScrollText("TEMPSENSOR MODE");
 
     RTC_C_holdClock(RTC_C_BASE);                           // Stop stopwatch
     RTC_C_holdCounterPrescale(RTC_C_BASE, RTC_C_PRESCALE_0);
 
-    // Select internal ref = 1.2V
-    Ref_A_setReferenceVoltage(REF_A_BASE,
-                              REF_A_VREF1_2V);
-    // Internal Reference ON
-    Ref_A_enableReferenceVoltage(REF_A_BASE);
-
-    // Enables the internal temperature sensor
-    Ref_A_enableTempSensor(REF_A_BASE);
-
-    while(!Ref_A_isVariableReferenceVoltageOutputReady(REF_A_BASE));
-
-    // Initialize the ADC12B Module
-    /*
-     * Base address of ADC12B Module
-     * Use internal ADC12B bit as sample/hold signal to start conversion
-     * USE MODOSC 5MHZ Digital Oscillator as clock source
-     * Use default clock divider/pre-divider of 1
-     * Use Temperature Sensor internal channel
-     */
-    ADC12_B_initParam initParam = {0};
-    initParam.sampleHoldSignalSourceSelect = ADC12_B_SAMPLEHOLDSOURCE_4;
-    initParam.clockSourceSelect = ADC12_B_CLOCKSOURCE_ADC12OSC;
-    initParam.clockSourceDivider = ADC12_B_CLOCKDIVIDER_1;
-    initParam.clockSourcePredivider = ADC12_B_CLOCKPREDIVIDER__1;
-    initParam.internalChannelMap = ADC12_B_TEMPSENSEMAP;
-    ADC12_B_init(ADC12_B_BASE, &initParam);
-
-    // Enable the ADC12B module
-    ADC12_B_enable(ADC12_B_BASE);
-
-    /*
-     * Base address of ADC12B Module
-     * For memory buffers 0-7 sample/hold for 256 clock cycles
-     * For memory buffers 8-15 sample/hold for 4 clock cycles (default)
-     * Disable Multiple Sampling
-     */
-    ADC12_B_setupSamplingTimer(ADC12_B_BASE,
-                               ADC12_B_CYCLEHOLD_256_CYCLES,
-                               ADC12_B_CYCLEHOLD_4_CYCLES,
-                               ADC12_B_MULTIPLESAMPLESDISABLE);
-
-    // Configure Memory Buffer
-    /*
-     * Base address of the ADC12B Module
-     * Configure memory buffer 0
-     * Map input A30 to memory buffer 0
-     * Vref+ = VRef+
-     * Vref- = Vref-
-     * Memory buffer 0 is the end of a sequence
-     */
-    ADC12_B_configureMemoryParam configureMemoryParam = {0};
-    configureMemoryParam.memoryBufferControlIndex = ADC12_B_MEMORY_0;
-    configureMemoryParam.inputSourceSelect = ADC12_B_INPUT_TCMAP;
-    configureMemoryParam.refVoltageSourceSelect =
-        ADC12_B_VREFPOS_INTBUF_VREFNEG_VSS;
-    configureMemoryParam.endOfSequence = ADC12_B_ENDOFSEQUENCE;
-    configureMemoryParam.windowComparatorSelect =
-        ADC12_B_WINDOW_COMPARATOR_DISABLE;
-    configureMemoryParam.differentialModeSelect =
-        ADC12_B_DIFFERENTIAL_MODE_DISABLE;
-    ADC12_B_configureMemory(ADC12_B_BASE, &configureMemoryParam);
-
-    ADC12_B_clearInterrupt(ADC12_B_BASE,
-                           0,
-                           ADC12_B_IFG0
-                           );
-
-    // Enable memory buffer 0 interrupt
-    ADC12_B_enableInterrupt(ADC12_B_BASE,
-                            ADC12_B_IE0,
-                            0,
-                            0);
-
-    // Start ADC conversion
-    ADC12_B_startConversion(ADC12_B_BASE, ADC12_B_START_AT_ADC12MEM0, ADC12_B_REPEATED_SINGLECHANNEL);
-
-    // TimerA1.1 (125ms ON-period) - ADC conversion trigger signal
-    Timer_A_initUpMode(TIMER_A1_BASE, &initUpParam_A1);
-
-    // Initialize compare mode to generate PWM1
-    Timer_A_initCompareMode(TIMER_A1_BASE, &initCompParam);
-
-    // Start timer A1 in up mode
-    Timer_A_startCounter(TIMER_A1_BASE,
-        TIMER_A_UP_MODE
-        );
-
-
     // Check if any button is pressed
     Timer_A_initUpMode(TIMER_A0_BASE, &initUpParam_A0);
-    __bis_SR_register(LPM3_bits | GIE);         // enter LPM3
-    __no_operation();
 }
 
-void displayTemp()
+void displayTemp(void)
 {
     clearLCD();
 

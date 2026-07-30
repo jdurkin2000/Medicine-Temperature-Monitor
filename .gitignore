@@ -18,6 +18,7 @@
 *.elf
 *.lst
 *.opt
+*.pp
 
 # CCStudio workspace/runtime state
 .metadata/

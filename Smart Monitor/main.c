@@ -51,13 +51,14 @@
  ******************************************************************************/
 
 #include <driverlib.h>
-#include "StopWatchMode.h"
 #include "TempSensorMode.h"
 #include "hal_LCD.h"
+#include "debug.h"
+#include "ds18b20.h"
 
 #define STARTUP_MODE         0
 
-volatile unsigned char mode = STARTUP_MODE;
+volatile unsigned char mode = TEMPSENSOR_MODE;
 volatile unsigned char S1buttonDebounce = 0;
 volatile unsigned char S2buttonDebounce = 0;
 volatile unsigned int holdCount = 0;
@@ -80,7 +81,7 @@ Timer_A_initUpModeParam initUpParam_A0 =
 // Initialization calls
 void Init_GPIO(void);
 void Init_Clock(void);
-
+void Init_UART(void);
 
 /*
  * Main routine
@@ -99,14 +100,19 @@ int main(void) {
     // Initializations
     Init_GPIO();
     Init_Clock();
+    Init_UART();
     Init_LCD();
-
+    
     GPIO_clearInterrupt(GPIO_PORT_P1, GPIO_PIN1);
     GPIO_clearInterrupt(GPIO_PORT_P1, GPIO_PIN2);
 
     __enable_interrupt();
 
-    displayScrollText("WELCOME TO THE FR6989 LAUNCHPAD");
+    // displayScrollText("WELCOME TO THE FR6989 LAUNCHPAD");
+    float temperature = get_temp();
+    uartSendString("Temp: ");
+    uartSendFloat(temperature, 2);
+    uartSendString(" C\r\n");
 
     int i = 0x01;
 
@@ -115,41 +121,6 @@ int main(void) {
         LCD_C_selectDisplayMemory(LCD_C_BASE, LCD_C_DISPLAYSOURCE_MEMORY);
         switch(mode)
         {
-            case STARTUP_MODE:        // Startup mode
-                // Set RTC counter to trigger interrupt every ~250 ms
-                RTC_C_initCounter(RTC_C_BASE, RTC_C_CLOCKSELECT_32KHZ_OSC, RTC_C_COUNTERSIZE_16BIT);
-                RTC_C_definePrescaleEvent(RTC_C_BASE, RTC_C_PRESCALE_1, RTC_C_PSEVENTDIVIDER_32);
-                RTC_C_enableInterrupt(RTC_C_BASE, RTC_C_PRESCALE_TIMER1_INTERRUPT);
-                RTC_C_startClock(RTC_C_BASE);
-
-                // Cycle through all LCD segments and display instruction message
-                if (i <= 0x80)
-                {
-                    LCDMEM[pos1] = LCDMEM[pos1+1] = i;
-                    LCDMEM[pos2] = LCDMEM[pos2+1] = i;
-                    LCDMEM[pos3] = LCDMEM[pos3+1] = i;
-                    LCDMEM[pos4] = LCDMEM[pos4+1] = i;
-                    LCDMEM[pos5] = LCDMEM[pos5+1] = i;
-                    LCDMEM[pos6] = LCDMEM[pos6+1] = i;
-                    LCDM14 = i << 4;
-                    LCDM18 = i;
-                    LCDM3 = i;
-                    i<<=1;
-                }
-                else
-                {
-                    i=1;
-                    clearLCD();
-                    displayScrollText("HOLD S1 AND S2 TO SWITCH MODES");
-                }
-                __bis_SR_register(LPM3_bits | GIE);         // enter LPM3
-                __no_operation();
-                break;
-            case STOPWATCH_MODE:         // Stopwatch Timer mode
-                clearLCD();              // Clear all LCD segments
-                stopWatchModeInit();     // Initialize stopwatch mode
-                stopWatch();
-                break;
             case TEMPSENSOR_MODE:        // Temperature Sensor mode
                 clearLCD();              // Clear all LCD segments
                 tempSensorModeInit();    // initialize temperature mode
@@ -157,6 +128,20 @@ int main(void) {
                 break;
         }
     }
+}
+
+
+void Init_UART(void) {
+    // Configure UART pins
+    P3SEL0 |= BIT4 | BIT5;                    
+    P3SEL1 &= ~(BIT4 | BIT5);
+
+    // Configure eUSCI_A0 for 9600 baud at 1MHz SMCLK
+    UCA1CTLW0 = UCSWRST;                      // Put eUSCI in reset
+    UCA1CTLW0 |= UCSSEL__SMCLK;               // SMCLK clock source
+    UCA1BRW = 6;                              // 1MHz / 16 / 9600 = ~6.5
+    UCA1MCTLW = 0x2000 | UCOS16 | UCBRF_8;    // Modulation settings
+    UCA1CTLW0 &= ~UCSWRST;                    // Initialize eUSCI
 }
 
 
@@ -286,21 +271,19 @@ __interrupt void PORT1_ISR(void)
                 // Set debounce flag on first high to low transition
                 S1buttonDebounce = 1;
                 holdCount = 0;
-                if (mode == STOPWATCH_MODE)
+                if (mode == 3)
                 {
                     
                 }
-                if (mode == TEMPSENSOR_MODE)
-                {
-                    // Start/Pause temp sensor
-                    tempSensorRunning ^= 0x1;
-                    if (tempSensorRunning)
-                        // Start ADC conversion
-                        ADC12_B_startConversion(ADC12_B_BASE, ADC12_B_START_AT_ADC12MEM0, ADC12_B_REPEATED_SINGLECHANNEL);
-                    else
-                        // Disable ADC conversion
-                        ADC12_B_disableConversions(ADC12_B_BASE,true);
-                }
+                // if (mode == TEMPSENSOR_MODE)
+                // {
+                //     if (tempSensorRunning)
+                //         // Start ADC conversion
+                //         ADC12_B_startConversion(ADC12_B_BASE, ADC12_B_START_AT_ADC12MEM0, ADC12_B_REPEATED_SINGLECHANNEL);
+                //     else
+                //         // Disable ADC conversion
+                //         ADC12_B_disableConversions(ADC12_B_BASE,true);
+                // }
 
                 // Start debounce timer
                 Timer_A_initUpMode(TIMER_A0_BASE, &initUpParam_A0);
@@ -315,42 +298,9 @@ __interrupt void PORT1_ISR(void)
                 holdCount = 0;
                 switch (mode)
                 {
-                    case STOPWATCH_MODE:
-                        // Reset stopwatch if stopped; Split if running
-                        if (!(stopWatchRunning))
-                        {
-                            if (LCDCMEMCTL & LCDDISP)
-                                LCDCMEMCTL &= ~LCDDISP;
-                            else
-                                resetStopWatch();
-                        }
-                        else
-                        {
-                            // Use LCD Blink memory to pause/resume stopwatch at split time
-                            LCDBMEM[pos1] = LCDMEM[pos1];
-                            LCDBMEM[pos1+1] = LCDMEM[pos1+1];
-                            LCDBMEM[pos2] = LCDMEM[pos2];
-                            LCDBMEM[pos2+1] = LCDMEM[pos2+1];
-                            LCDBMEM[pos3] = LCDMEM[pos3];
-                            LCDBMEM[pos3+1] = LCDMEM[pos3+1];
-                            LCDBMEM[pos4] = LCDMEM[pos4];
-                            LCDBMEM[pos4+1] = LCDMEM[pos4+1];
-                            LCDBMEM[pos5] = LCDMEM[pos5];
-                            LCDBMEM[pos5+1] = LCDMEM[pos5+1];
-                            LCDBMEM[pos6] = LCDMEM[pos6];
-                            LCDBMEM[pos6+1] = LCDMEM[pos6+1];
-                            LCDBM3 = LCDM3;
-
-                            // Toggle between LCD Normal/Blink memory
-                            LCDCMEMCTL ^= LCDDISP;
-                        }
-                        break;
                     case TEMPSENSOR_MODE:
                         // Toggle temperature unit flag
                         tempUnit ^= 0x01;
-                        // Update LCD when temp sensor is not running
-                        if (!tempSensorRunning)
-                            displayTemp();
                         break;
                 }
 
@@ -384,18 +334,17 @@ __interrupt void TIMER0_A0_ISR (void)
 
             // Change mode
             if (mode == STARTUP_MODE)
-                mode = STOPWATCH_MODE;
-            else if (mode == STOPWATCH_MODE)
-            {
-                mode = TEMPSENSOR_MODE;
-                stopWatchRunning = 0;
-                // Hold RTC
-                RTC_C_holdClock(RTC_C_BASE);
-            }
+                {}
+            // else if (mode == STOPWATCH_MODE)
+            // {
+            //     mode = TEMPSENSOR_MODE;
+            //     stopWatchRunning = 0;
+            //     // Hold RTC
+            //     RTC_C_holdClock(RTC_C_BASE);
+            // }
             else if (mode == TEMPSENSOR_MODE)
             {
-                mode = STOPWATCH_MODE;
-                tempSensorRunning = 0;
+                //mode = STOPWATCH_MODE;
                 // Disable ADC12, TimerA1, Internal Ref and Temp used by TempSensor Mode
                 ADC12_B_disable(ADC12_B_BASE);
                 ADC12_B_disableConversions(ADC12_B_BASE,true);
@@ -427,7 +376,7 @@ __interrupt void TIMER0_A0_ISR (void)
         Timer_A_stop(TIMER_A0_BASE);
     }
 
-    if (mode == STOPWATCH_MODE || mode == TEMPSENSOR_MODE)
+    if (mode == TEMPSENSOR_MODE)
         __bic_SR_register_on_exit(LPM3_bits);            // exit LPM3
 }
 
