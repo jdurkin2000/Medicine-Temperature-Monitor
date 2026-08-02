@@ -4,6 +4,8 @@
 #include "ds18b20.h"
 
 float get_temp(void);
+void ds18b20_start_conversion(void);
+float ds18b20_read_temperature(void);
 void delay_us(unsigned long microseconds);
 void reset_18B20(void);
 void send_18B20(char data);
@@ -44,22 +46,43 @@ void delay_us(unsigned long microseconds)
     }
 }
 
-float get_temp(void)
+void ds18b20_start_conversion(void)
 {
-    unsigned int temp;
     reset_18B20();
     send_18B20(0xcc);   //send CCH,Skip ROM command
     send_18B20(0x44);
-    // A 12-bit DS18B20 conversion can take up to 750 ms.
-    delay_us(750000UL);
+}
+
+float ds18b20_read_temperature(void)
+{
+    unsigned int temp;
+    int signedTemp;
 
     reset_18B20();
     send_18B20(0xcc);   //send CCH,Skip ROM command
     send_18B20(0xbe);
 
     temp = read_18B20();
-    return((float)temp/8.0);
 
+    /*
+     * read_18B20() returns the signed DS18B20 value shifted right once.
+     * Restore the sign bit before converting the 1/8-degree result.
+     */
+    if (temp & 0x4000U)
+        temp |= 0x8000U;
+    signedTemp = (int)temp;
+
+    return((float)signedTemp/8.0f);
+}
+
+float get_temp(void)
+{
+    ds18b20_start_conversion();
+
+    // Blocking compatibility path. Temperature mode uses LPM3 instead.
+    delay_us(750000UL);
+
+    return ds18b20_read_temperature();
 }
 
 void reset_18B20(void)

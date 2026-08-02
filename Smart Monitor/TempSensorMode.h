@@ -44,7 +44,22 @@
 #ifndef OUTOFBOX_MSP430FR6989_TEMPSENSORMODE_H_
 #define OUTOFBOX_MSP430FR6989_TEMPSENSORMODE_H_
 
-#define TEMPSENSOR_MODE       2
+#define TEMPSENSOR_MODE 2
+
+/*
+ * Extra wait after each 750 ms DS18B20 conversion, in 32768 Hz ACLK ticks.
+ * The short normal delay is convenient for prototyping; the alarm has no
+ * extra delay so it samples as quickly as a 12-bit conversion allows.
+ */
+#define TEMP_NORMAL_UPDATE_TICKS 32768UL
+#define TEMP_ALARM_UPDATE_TICKS 0UL
+
+/*
+ * Alarm limits are stored in tenths of a degree Celsius. These defaults
+ * implement the common 2 C to 8 C refrigerated-medicine storage range.
+ */
+volatile int16_t temp_alarm_low_tenths_c = 20;
+volatile int16_t temp_alarm_high_tenths_c = 80;
 
 extern volatile unsigned char mode;
 extern volatile unsigned char S1buttonDebounce;
@@ -54,6 +69,9 @@ extern volatile unsigned char tempUnit;
 
 void tempSensor(void);
 void tempSensorModeInit(void);
+void tempSensorRequestDisplayRefresh(void);
+unsigned char tempSensorIsAlarmActive(void);
+void tempSensorAcknowledgeAlarm(void);
 void displayTemp(void);
 
 #endif /* OUTOFBOX_MSP430FR6989_TEMPSENSORMODE_H_ */

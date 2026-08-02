@@ -53,8 +53,6 @@
 #include <driverlib.h>
 #include "TempSensorMode.h"
 #include "hal_LCD.h"
-#include "debug.h"
-#include "ds18b20.h"
 
 #define STARTUP_MODE         0
 
@@ -107,14 +105,6 @@ int main(void) {
     GPIO_clearInterrupt(GPIO_PORT_P1, GPIO_PIN2);
 
     __enable_interrupt();
-
-    // displayScrollText("WELCOME TO THE FR6989 LAUNCHPAD");
-    float temperature = get_temp();
-    uartSendString("Temp: ");
-    uartSendFloat(temperature, 2);
-    uartSendString(" C\r\n");
-
-    int i = 0x01;
 
     while(1)
     {
@@ -265,15 +255,17 @@ __interrupt void PORT1_ISR(void)
         case P1IV_NONE : break;
         case P1IV_P1IFG0 : break;
         case P1IV_P1IFG1 :    // Button S1 pressed
-            P1OUT |= BIT0;    // Turn LED1 On
             if ((S1buttonDebounce) == 0)
             {
                 // Set debounce flag on first high to low transition
                 S1buttonDebounce = 1;
                 holdCount = 0;
-                if (mode == 3)
+
+                if ((mode == TEMPSENSOR_MODE) &&
+                    tempSensorIsAlarmActive())
                 {
-                    
+                    tempSensorAcknowledgeAlarm();
+                    __bic_SR_register_on_exit(LPM3_bits);
                 }
                 // if (mode == TEMPSENSOR_MODE)
                 // {
@@ -290,7 +282,6 @@ __interrupt void PORT1_ISR(void)
             }
             break;
         case P1IV_P1IFG2 :    // Button S2 pressed
-            P9OUT |= BIT7;    // Turn LED2 On
             if ((S2buttonDebounce) == 0)
             {
                 // Set debounce flag on first high to low transition
@@ -299,8 +290,17 @@ __interrupt void PORT1_ISR(void)
                 switch (mode)
                 {
                     case TEMPSENSOR_MODE:
-                        // Toggle temperature unit flag
-                        tempUnit ^= 0x01;
+                        if (tempSensorIsAlarmActive())
+                        {
+                            tempSensorAcknowledgeAlarm();
+                        }
+                        else
+                        {
+                            // Toggle temperature unit flag
+                            tempUnit ^= 0x01;
+                            tempSensorRequestDisplayRefresh();
+                        }
+                        __bic_SR_register_on_exit(LPM3_bits);
                         break;
                 }
 
@@ -342,15 +342,6 @@ __interrupt void TIMER0_A0_ISR (void)
             //     // Hold RTC
             //     RTC_C_holdClock(RTC_C_BASE);
             // }
-            else if (mode == TEMPSENSOR_MODE)
-            {
-                //mode = STOPWATCH_MODE;
-                // Disable ADC12, TimerA1, Internal Ref and Temp used by TempSensor Mode
-                ADC12_B_disable(ADC12_B_BASE);
-                ADC12_B_disableConversions(ADC12_B_BASE,true);
-
-                Timer_A_stop(TIMER_A1_BASE);
-            }
             __bic_SR_register_on_exit(LPM3_bits);                // exit LPM3
         }
     }
@@ -359,14 +350,12 @@ __interrupt void TIMER0_A0_ISR (void)
     if (P1IN & BIT1)
     {
         S1buttonDebounce = 0;                                   // Clear button debounce
-        P1OUT &= ~BIT0;
     }
 
     // Button S2 released
     if (P1IN & BIT2)
     {
         S2buttonDebounce = 0;                                   // Clear button debounce
-        P9OUT &= ~BIT7;
     }
 
     // Both button S1 & S2 released

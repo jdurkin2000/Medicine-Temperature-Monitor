@@ -2,6 +2,8 @@
 #define DS18B20_H_
 
 float get_temp(void);
+void ds18b20_start_conversion(void);
+float ds18b20_read_temperature(void);
 void delay_us(unsigned long microseconds);
 void reset_18B20(void);
 void send_18B20(char data);
