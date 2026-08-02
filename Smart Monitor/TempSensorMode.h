@@ -44,7 +44,10 @@
 #ifndef OUTOFBOX_MSP430FR6989_TEMPSENSORMODE_H_
 #define OUTOFBOX_MSP430FR6989_TEMPSENSORMODE_H_
 
+#include <stdint.h>
+
 #define TEMPSENSOR_MODE 2
+#define ACLK_FREQUENCY_HZ 32768UL
 
 /*
  * Extra wait after each 750 ms DS18B20 conversion, in 32768 Hz ACLK ticks.
@@ -55,16 +58,31 @@
 #define TEMP_ALARM_UPDATE_TICKS 0UL
 
 /*
+ * Button timing is based on ACLK so holds continue to advance in LPM3.
+ * These millisecond values are the user-adjustable input timings.
+ */
+#define BUTTON_TIMER_INTERVAL_MS 20U
+#define BUTTON_LONG_PRESS_MS 1000U
+#define BUTTON_RELEASE_DEBOUNCE_MS 40U
+#define BUTTON_FEEDBACK_BEEP_MS 100U
+
+#define BUTTON_LONG_PRESS_TICKS \
+    ((BUTTON_LONG_PRESS_MS + BUTTON_TIMER_INTERVAL_MS - 1U) / \
+     BUTTON_TIMER_INTERVAL_MS)
+#define BUTTON_RELEASE_DEBOUNCE_TICKS \
+    ((BUTTON_RELEASE_DEBOUNCE_MS + BUTTON_TIMER_INTERVAL_MS - 1U) / \
+     BUTTON_TIMER_INTERVAL_MS)
+
+/*
  * Alarm limits are stored in tenths of a degree Celsius. These defaults
  * implement the common 2 C to 8 C refrigerated-medicine storage range.
  */
-volatile int16_t temp_alarm_low_tenths_c = 20;
-volatile int16_t temp_alarm_high_tenths_c = 80;
+extern volatile int16_t temp_alarm_low_tenths_c;
+extern volatile int16_t temp_alarm_high_tenths_c;
 
 extern volatile unsigned char mode;
 extern volatile unsigned char S1buttonDebounce;
 extern volatile unsigned char S2buttonDebounce;
-extern Timer_A_initUpModeParam initUpParam_A0;
 extern volatile unsigned char tempUnit;
 
 void tempSensor(void);
@@ -72,6 +90,7 @@ void tempSensorModeInit(void);
 void tempSensorRequestDisplayRefresh(void);
 unsigned char tempSensorIsAlarmActive(void);
 void tempSensorAcknowledgeAlarm(void);
+void tempSensorStartButtonFeedback(void);
 void displayTemp(void);
 
 #endif /* OUTOFBOX_MSP430FR6989_TEMPSENSORMODE_H_ */

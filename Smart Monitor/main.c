@@ -51,30 +51,34 @@
  ******************************************************************************/
 
 #include <driverlib.h>
+#include "SettingsMode.h"
 #include "TempSensorMode.h"
 #include "hal_LCD.h"
 
-#define STARTUP_MODE         0
+#define ACLK_TICKS_FROM_MS(milliseconds) \
+    ((ACLK_FREQUENCY_HZ * (milliseconds) + 999UL) / 1000UL)
+#define BUTTON_TIMER_CCR0 \
+    ((unsigned int)(ACLK_TICKS_FROM_MS(BUTTON_TIMER_INTERVAL_MS) - 1UL))
+#define SETTINGS_SCROLL_TIMER_CCR0 \
+    ((unsigned int)(ACLK_TICKS_FROM_MS(SETTINGS_SCROLL_STEP_MS) - 1UL))
 
 volatile unsigned char mode = TEMPSENSOR_MODE;
 volatile unsigned char S1buttonDebounce = 0;
 volatile unsigned char S2buttonDebounce = 0;
-volatile unsigned int holdCount = 0;
 volatile unsigned int counter = 0;
 volatile int centisecond = 0;
 Calendar currentTime;
 
-// TimerA0 UpMode Configuration Parameter
-Timer_A_initUpModeParam initUpParam_A0 =
-{
-        TIMER_A_CLOCKSOURCE_SMCLK,              // SMCLK Clock Source
-        TIMER_A_CLOCKSOURCE_DIVIDER_1,          // SMCLK/4 = 2MHz
-        30000,                                  // 15ms debounce period
-        TIMER_A_TAIE_INTERRUPT_DISABLE,         // Disable Timer interrupt
-        TIMER_A_CCIE_CCR0_INTERRUPT_ENABLE ,    // Enable CCR0 interrupt
-        TIMER_A_DO_CLEAR,                       // Clear value
-        true                                    // Start Timer
-};
+static volatile unsigned char buttonTimerRunning;
+static volatile unsigned int buttonTimerIntervalMs;
+static volatile unsigned int s1HoldTicks;
+static volatile unsigned int s2HoldTicks;
+static volatile unsigned char s1ReleaseTicks;
+static volatile unsigned char s2ReleaseTicks;
+static volatile unsigned char s1LongHandled;
+static volatile unsigned char s2LongHandled;
+static volatile unsigned char s1PressConsumed;
+static volatile unsigned char s2PressConsumed;
 
 // Initialization calls
 void Init_GPIO(void);
@@ -88,19 +92,14 @@ int main(void) {
     // Stop watchdog timer
     WDT_A_hold(__MSP430_BASEADDRESS_WDT_A__);
 
-    // Disable the GPIO power-on default high-impedance mode to activate
-    // previously configured port settings
-    PMM_unlockLPM5();
-
-    //enable interrupts
-    __enable_interrupt();
-
-    // Initializations
+    // Finish all peripheral and UI state initialization before enabling ISRs.
     Init_GPIO();
     Init_Clock();
     Init_UART();
     Init_LCD();
-    
+    settingsModeInit();
+    tempSensorModeInit();
+
     GPIO_clearInterrupt(GPIO_PORT_P1, GPIO_PIN1);
     GPIO_clearInterrupt(GPIO_PORT_P1, GPIO_PIN2);
 
@@ -113,7 +112,6 @@ int main(void) {
         {
             case TEMPSENSOR_MODE:        // Temperature Sensor mode
                 clearLCD();              // Clear all LCD segments
-                tempSensorModeInit();    // initialize temperature mode
                 tempSensor();
                 break;
         }
@@ -123,10 +121,10 @@ int main(void) {
 
 void Init_UART(void) {
     // Configure UART pins
-    P3SEL0 |= BIT4 | BIT5;                    
+    P3SEL0 |= BIT4 | BIT5;
     P3SEL1 &= ~(BIT4 | BIT5);
 
-    // Configure eUSCI_A0 for 9600 baud at 1MHz SMCLK
+    // Configure eUSCI_A1 for 9600 baud at 1MHz SMCLK
     UCA1CTLW0 = UCSWRST;                      // Put eUSCI in reset
     UCA1CTLW0 |= UCSSEL__SMCLK;               // SMCLK clock source
     UCA1BRW = 6;                              // 1MHz / 16 / 9600 = ~6.5
@@ -195,12 +193,26 @@ void Init_Clock()
     // Set DCO frequency to default 8MHz
     CS_setDCOFreq(CS_DCORSEL_0, CS_DCOFSEL_6);
 
-    // Configure MCLK and SMCLK to default 2MHz
+    // Configure MCLK and SMCLK to 1MHz
     CS_initClockSignal(CS_MCLK, CS_DCOCLK_SELECT, CS_CLOCK_DIVIDER_8);
     CS_initClockSignal(CS_SMCLK, CS_DCOCLK_SELECT, CS_CLOCK_DIVIDER_8);
 
     // Intializes the XT1 crystal oscillator
     CS_turnOnLFXT(CS_LFXT_DRIVE_3);
+}
+
+static void startButtonTimer(void)
+{
+    if (buttonTimerRunning &&
+        (buttonTimerIntervalMs == BUTTON_TIMER_INTERVAL_MS))
+        return;
+
+    buttonTimerRunning = 1;
+    buttonTimerIntervalMs = BUTTON_TIMER_INTERVAL_MS;
+    TA0CTL = MC__STOP | TACLR;
+    TA0CCR0 = BUTTON_TIMER_CCR0;
+    TA0CCTL0 = CCIE;
+    TA0CTL = TASSEL__ACLK | MC__UP | TACLR;
 }
 
 /*
@@ -255,57 +267,47 @@ __interrupt void PORT1_ISR(void)
         case P1IV_NONE : break;
         case P1IV_P1IFG0 : break;
         case P1IV_P1IFG1 :    // Button S1 pressed
-            if ((S1buttonDebounce) == 0)
+            if (((S1buttonDebounce) == 0) && !(P1IN & BIT1))
             {
-                // Set debounce flag on first high to low transition
                 S1buttonDebounce = 1;
-                holdCount = 0;
+                s1HoldTicks = 0;
+                s1ReleaseTicks = 0;
+                s1LongHandled = 0;
+                s1PressConsumed = 0;
+
+                tempSensorStartButtonFeedback();
 
                 if ((mode == TEMPSENSOR_MODE) &&
                     tempSensorIsAlarmActive())
                 {
                     tempSensorAcknowledgeAlarm();
-                    __bic_SR_register_on_exit(LPM3_bits);
+                    s1PressConsumed = 1;
                 }
-                // if (mode == TEMPSENSOR_MODE)
-                // {
-                //     if (tempSensorRunning)
-                //         // Start ADC conversion
-                //         ADC12_B_startConversion(ADC12_B_BASE, ADC12_B_START_AT_ADC12MEM0, ADC12_B_REPEATED_SINGLECHANNEL);
-                //     else
-                //         // Disable ADC conversion
-                //         ADC12_B_disableConversions(ADC12_B_BASE,true);
-                // }
 
-                // Start debounce timer
-                Timer_A_initUpMode(TIMER_A0_BASE, &initUpParam_A0);
+                startButtonTimer();
+                __bic_SR_register_on_exit(LPM3_bits);
             }
             break;
         case P1IV_P1IFG2 :    // Button S2 pressed
-            if ((S2buttonDebounce) == 0)
+            if (((S2buttonDebounce) == 0) && !(P1IN & BIT2))
             {
-                // Set debounce flag on first high to low transition
                 S2buttonDebounce = 1;
-                holdCount = 0;
-                switch (mode)
+                s2HoldTicks = 0;
+                s2ReleaseTicks = 0;
+                s2LongHandled = 0;
+                s2PressConsumed = 0;
+
+                tempSensorStartButtonFeedback();
+
+                if ((mode == TEMPSENSOR_MODE) &&
+                    tempSensorIsAlarmActive())
                 {
-                    case TEMPSENSOR_MODE:
-                        if (tempSensorIsAlarmActive())
-                        {
-                            tempSensorAcknowledgeAlarm();
-                        }
-                        else
-                        {
-                            // Toggle temperature unit flag
-                            tempUnit ^= 0x01;
-                            tempSensorRequestDisplayRefresh();
-                        }
-                        __bic_SR_register_on_exit(LPM3_bits);
-                        break;
+                    tempSensorAcknowledgeAlarm();
+                    s2PressConsumed = 1;
                 }
 
-                // Start debounce timer
-                Timer_A_initUpMode(TIMER_A0_BASE, &initUpParam_A0);
+                startButtonTimer();
+                __bic_SR_register_on_exit(LPM3_bits);
             }
             break;
         case P1IV_P1IFG3 : break;
@@ -323,49 +325,149 @@ __interrupt void PORT1_ISR(void)
 #pragma vector = TIMER0_A0_VECTOR
 __interrupt void TIMER0_A0_ISR (void)
 {
-    // Both button S1 & S2 held down
-    if (!(P1IN & BIT1) && !(P1IN & BIT2))
-    {
-        holdCount++;
-        if (holdCount == 40)
-        {
-            // Stop Timer A0
-            Timer_A_stop(TIMER_A0_BASE);
+    unsigned char wakeForeground =
+        settingsModeTimerTick(buttonTimerIntervalMs);
 
-            // Change mode
-            if (mode == STARTUP_MODE)
-                {}
-            // else if (mode == STOPWATCH_MODE)
-            // {
-            //     mode = TEMPSENSOR_MODE;
-            //     stopWatchRunning = 0;
-            //     // Hold RTC
-            //     RTC_C_holdClock(RTC_C_BASE);
-            // }
-            __bic_SR_register_on_exit(LPM3_bits);                // exit LPM3
+    if (S1buttonDebounce)
+    {
+        if (!(P1IN & BIT1))
+        {
+            s1ReleaseTicks = 0;
+
+            if (!s1LongHandled && !s1PressConsumed)
+            {
+                if (s1HoldTicks < BUTTON_LONG_PRESS_TICKS)
+                    s1HoldTicks++;
+
+                if (s1HoldTicks >= BUTTON_LONG_PRESS_TICKS)
+                {
+                    s1LongHandled = 1;
+
+                    if (settingsModeIsActive())
+                    {
+                        settingsModeExit();
+                        tempSensorRequestDisplayRefresh();
+                        wakeForeground = 1;
+                    }
+                    else if ((P1IN & BIT2) &&
+                             !tempSensorIsAlarmActive())
+                    {
+                        settingsModeEnter();
+                        wakeForeground = 1;
+                    }
+                }
+            }
+        }
+        else
+        {
+            if (s1ReleaseTicks < BUTTON_RELEASE_DEBOUNCE_TICKS)
+                s1ReleaseTicks++;
+
+            if (s1ReleaseTicks >= BUTTON_RELEASE_DEBOUNCE_TICKS)
+            {
+                if (!s1LongHandled && !s1PressConsumed)
+                {
+                    if (tempSensorIsAlarmActive())
+                    {
+                        tempSensorAcknowledgeAlarm();
+                        wakeForeground = 1;
+                    }
+                    else if (settingsModeIsActive())
+                    {
+                        settingsModeSelectOption();
+                    }
+                }
+
+                P1IFG &= ~BIT1;
+                S1buttonDebounce = 0;
+                s1HoldTicks = 0;
+                s1ReleaseTicks = 0;
+            }
         }
     }
 
-    // Button S1 released
-    if (P1IN & BIT1)
+    if (S2buttonDebounce)
     {
-        S1buttonDebounce = 0;                                   // Clear button debounce
+        if (!(P1IN & BIT2))
+        {
+            s2ReleaseTicks = 0;
+
+            if (!s2LongHandled && !s2PressConsumed)
+            {
+                if (s2HoldTicks < BUTTON_LONG_PRESS_TICKS)
+                    s2HoldTicks++;
+
+                if (s2HoldTicks >= BUTTON_LONG_PRESS_TICKS)
+                {
+                    s2LongHandled = 1;
+
+                    if (settingsModeIsActive())
+                    {
+                        settingsModeExit();
+                        tempSensorRequestDisplayRefresh();
+                        wakeForeground = 1;
+                    }
+                }
+            }
+        }
+        else
+        {
+            if (s2ReleaseTicks < BUTTON_RELEASE_DEBOUNCE_TICKS)
+                s2ReleaseTicks++;
+
+            if (s2ReleaseTicks >= BUTTON_RELEASE_DEBOUNCE_TICKS)
+            {
+                if (!s2LongHandled && !s2PressConsumed)
+                {
+                    if (tempSensorIsAlarmActive())
+                    {
+                        tempSensorAcknowledgeAlarm();
+                        wakeForeground = 1;
+                    }
+                    else if (settingsModeIsActive())
+                    {
+                        settingsModeNextOption();
+                        wakeForeground = 1;
+                    }
+                    else
+                    {
+                        tempUnit ^= 0x01;
+                        tempSensorRequestDisplayRefresh();
+                        wakeForeground = 1;
+                    }
+                }
+
+                P1IFG &= ~BIT2;
+                S2buttonDebounce = 0;
+                s2HoldTicks = 0;
+                s2ReleaseTicks = 0;
+            }
+        }
     }
 
-    // Button S2 released
-    if (P1IN & BIT2)
+    if (!S1buttonDebounce && !S2buttonDebounce)
     {
-        S2buttonDebounce = 0;                                   // Clear button debounce
+        if (settingsModeNeedsTimer())
+        {
+            if (buttonTimerIntervalMs != SETTINGS_SCROLL_STEP_MS)
+            {
+                buttonTimerIntervalMs = SETTINGS_SCROLL_STEP_MS;
+                TA0CTL = MC__STOP | TACLR;
+                TA0CCR0 = SETTINGS_SCROLL_TIMER_CCR0;
+                TA0CCTL0 = CCIE;
+                TA0CTL = TASSEL__ACLK | MC__UP | TACLR;
+            }
+        }
+        else
+        {
+            TA0CTL = MC__STOP | TACLR;
+            TA0CCTL0 &= ~CCIE;
+            buttonTimerRunning = 0;
+            buttonTimerIntervalMs = 0;
+        }
     }
 
-    // Both button S1 & S2 released
-    if ((P1IN & BIT1) && (P1IN & BIT2))
-    {
-        // Stop timer A0
-        Timer_A_stop(TIMER_A0_BASE);
-    }
-
-    if (mode == TEMPSENSOR_MODE)
+    if ((mode == TEMPSENSOR_MODE) && wakeForeground)
         __bic_SR_register_on_exit(LPM3_bits);            // exit LPM3
 }
 

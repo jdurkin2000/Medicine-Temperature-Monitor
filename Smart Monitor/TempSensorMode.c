@@ -42,6 +42,7 @@
  ******************************************************************************/
 
 #include <driverlib.h>
+#include "SettingsMode.h"
 #include "TempSensorMode.h"
 #include "hal_LCD.h"
 #include "debug.h"
@@ -50,6 +51,8 @@
 volatile unsigned char tempUnit = 0; // Temperature Unit
 volatile int degC;                   // Celsius, in tenths of a degree
 volatile int degF;                   // Fahrenheit, in tenths of a degree
+volatile int16_t temp_alarm_low_tenths_c = 20;
+volatile int16_t temp_alarm_high_tenths_c = 80;
 
 #define DS18B20_CONVERSION_TICKS 24576UL // 750 ms at 32768 Hz
 #define MEASUREMENT_LED_ON_TICKS 1638UL  // 50 ms green measurement flash
@@ -63,13 +66,85 @@ volatile int degF;                   // Fahrenheit, in tenths of a degree
 #define BUZZER_TIMER_PERIOD 15U
 #define BUZZER_TIMER_DUTY 1U
 #define LCD_EXCLAMATION_BIT BIT0
+#define TEMPERATURE_HISTORY_MAGIC 0x544DU
+#define TEMPERATURE_HISTORY_CAPACITY 64U
+#define BUTTON_FEEDBACK_BEEP_ACLK_TICKS \
+    ((ACLK_FREQUENCY_HZ * BUTTON_FEEDBACK_BEEP_MS + 999UL) / 1000UL)
+
+typedef struct
+{
+    uint16_t magic;
+    uint16_t nextIndex;
+    uint16_t sampleCount;
+    int16_t samplesTenthsC[TEMPERATURE_HISTORY_CAPACITY];
+} TemperatureHistoryLog;
+
+/*
+ * PERSISTENT places this ring buffer in writable FRAM without C startup
+ * reinitializing it after a reset. A new firmware load may still erase it.
+ */
+#if defined(__TI_COMPILER_VERSION__)
+#pragma PERSISTENT(temperatureHistoryLog)
+#endif
+TemperatureHistoryLog temperatureHistoryLog = {0};
 
 static volatile unsigned char lpm3DelayComplete;
 static volatile unsigned char displayRefreshRequested;
 static volatile unsigned char alarmAcknowledgeRequested;
 static volatile unsigned char tempAlarmActive;
+static volatile unsigned char feedbackToneRequested;
 static unsigned char alarmArmed = 1;
 static unsigned char alarmSignalOn;
+static volatile unsigned char alarmToneRequested;
+static volatile unsigned char buzzerToneOn;
+
+/*
+ * MSP430FR6989 erratum PMM32 requires LPM3/4 entry to execute from RAM after
+ * putting FRAM into inactive mode. The linker command file already copies
+ * .TI.ramfunc into RAM during startup.
+ */
+#if defined(__TI_COMPILER_VERSION__)
+#pragma CODE_SECTION(enterLpm3FromRam, ".TI.ramfunc")
+#endif
+static void enterLpm3FromRam(unsigned short lowPowerMode)
+{
+    FRCTL0 = FRCTLPW;
+    GCCTL0 &= ~(FRPWR | FRLPMPWR);
+    FRCTL0_H = 0;
+    __bis_SR_register(lowPowerMode);
+}
+
+static void updateBuzzerOutput(void)
+{
+    unsigned int interruptState = __get_SR_register() & GIE;
+    unsigned char toneRequested;
+
+    __disable_interrupt();
+    toneRequested =
+        alarmToneRequested || feedbackToneRequested;
+
+    if (toneRequested)
+    {
+        if (!buzzerToneOn)
+        {
+            TA1CCR0 = BUZZER_TIMER_PERIOD;
+            TA1CCR2 = BUZZER_TIMER_DUTY;
+            TA1CCTL2 = OUTMOD_7;
+            TA1CTL = TASSEL__ACLK | MC__UP | TACLR;
+            buzzerToneOn = 1;
+        }
+    }
+    else
+    {
+        TA1CTL = MC__STOP | TACLR;
+        TA1CCTL2 = OUTMOD_0;
+        P1OUT &= ~BIT3;
+        buzzerToneOn = 0;
+    }
+
+    if (interruptState)
+        __enable_interrupt();
+}
 
 static void setAlarmOutputs(unsigned char enabled)
 {
@@ -79,17 +154,44 @@ static void setAlarmOutputs(unsigned char enabled)
     if (enabled)
     {
         P1OUT |= BIT0;
-        TA1CCR0 = BUZZER_TIMER_PERIOD;
-        TA1CCR2 = BUZZER_TIMER_DUTY;
-        TA1CCTL2 = OUTMOD_7;
-        TA1CTL = TASSEL__ACLK | MC__UP | TACLR;
     }
     else
     {
         P1OUT &= ~BIT0;
-        TA1CTL = MC__STOP | TACLR;
-        TA1CCTL2 = OUTMOD_0;
     }
+
+    alarmToneRequested = enabled;
+    updateBuzzerOutput();
+}
+
+static void initializeTemperatureHistory(void)
+{
+    if ((temperatureHistoryLog.magic != TEMPERATURE_HISTORY_MAGIC) ||
+        (temperatureHistoryLog.nextIndex >= TEMPERATURE_HISTORY_CAPACITY) ||
+        (temperatureHistoryLog.sampleCount > TEMPERATURE_HISTORY_CAPACITY))
+    {
+        temperatureHistoryLog.magic = 0;
+        temperatureHistoryLog.nextIndex = 0;
+        temperatureHistoryLog.sampleCount = 0;
+        // Commit the validity marker last so an interrupted init retries.
+        temperatureHistoryLog.magic = TEMPERATURE_HISTORY_MAGIC;
+    }
+}
+
+static void logTemperatureSample(int16_t temperatureTenthsC)
+{
+    uint16_t writeIndex = temperatureHistoryLog.nextIndex;
+    uint16_t followingIndex = writeIndex + 1U;
+
+    if (followingIndex >= TEMPERATURE_HISTORY_CAPACITY)
+        followingIndex = 0;
+
+    temperatureHistoryLog.samplesTenthsC[writeIndex] = temperatureTenthsC;
+    // nextIndex is always committed as a valid value, even at ring wrap.
+    temperatureHistoryLog.nextIndex = followingIndex;
+
+    if (temperatureHistoryLog.sampleCount < TEMPERATURE_HISTORY_CAPACITY)
+        temperatureHistoryLog.sampleCount++;
 }
 
 static unsigned char serviceAlarmAcknowledgement(void)
@@ -107,6 +209,7 @@ static unsigned char serviceAlarmAcknowledgement(void)
     alarmArmed = 0;
     alarmSignalOn = 0;
     setAlarmOutputs(0);
+    settingsModeExit();
     displayTemp();
     return 1;
 }
@@ -127,6 +230,43 @@ void tempSensorAcknowledgeAlarm(void)
         alarmAcknowledgeRequested = 1;
 }
 
+void tempSensorStartButtonFeedback(void)
+{
+    unsigned int interruptState = __get_SR_register() & GIE;
+
+    __disable_interrupt();
+
+    // Timer B0 is a one-shot duration timer; Timer A1 generates the tone.
+    TB0CTL = MC__STOP | TBCLR;
+    TB0CCTL0 = 0;
+    TB0CCR0 = (unsigned int)(BUTTON_FEEDBACK_BEEP_ACLK_TICKS - 1UL);
+    feedbackToneRequested = 1;
+    updateBuzzerOutput();
+    TB0CCTL0 = CCIE;
+    TB0CTL = TBSSEL__ACLK | MC__UP | TBCLR;
+
+    if (interruptState)
+        __enable_interrupt();
+}
+
+static void serviceDisplayRequests(void)
+{
+    unsigned int interruptState;
+    unsigned char refreshTemperature;
+
+    settingsModeServiceDisplay();
+
+    interruptState = __get_SR_register() & GIE;
+    __disable_interrupt();
+    refreshTemperature = displayRefreshRequested;
+    displayRefreshRequested = 0;
+    if (interruptState)
+        __enable_interrupt();
+
+    if (refreshTemperature && !settingsModeIsActive())
+        displayTemp();
+}
+
 static unsigned char sleepForAclkticks(unsigned long ticks)
 {
     while (ticks != 0UL)
@@ -135,6 +275,8 @@ static unsigned char sleepForAclkticks(unsigned long ticks)
 
         if (serviceAlarmAcknowledgement())
             return 0;
+
+        serviceDisplayRequests();
 
         interval = (ticks > 0xFFFFUL) ? 0xFFFFU : (unsigned int)ticks;
         lpm3DelayComplete = 0;
@@ -163,24 +305,21 @@ static unsigned char sleepForAclkticks(unsigned long ticks)
                 return 0;
             }
 
-            if (displayRefreshRequested)
-            {
-                displayRefreshRequested = 0;
-                __enable_interrupt();
-                displayTemp();
-                __disable_interrupt();
-            }
+            __enable_interrupt();
+            serviceDisplayRequests();
+            __disable_interrupt();
 
             if (lpm3DelayComplete)
                 break;
 
-            __bis_SR_register(LPM3_bits | GIE);
+            enterLpm3FromRam(LPM3_bits | GIE);
             __disable_interrupt();
         }
         __enable_interrupt();
 
         TA3CCTL0 = 0;
         TA3CTL = MC__STOP;
+        serviceDisplayRequests();
         ticks -= interval;
     }
 
@@ -222,6 +361,7 @@ void tempSensor(void)
         unsigned char temperatureInRange;
 
         serviceAlarmAcknowledgement();
+        serviceDisplayRequests();
 
         if (tempAlarmActive)
         {
@@ -266,6 +406,9 @@ void tempSensor(void)
 
         degF = degC * 9 / 5 + 320;
 
+        // Log every completed sample, even while the settings LCD is active.
+        logTemperatureSample((int16_t)degC);
+
         uartSendFloat(degF / 10.0, 2);
         uartSendChar('F');
 
@@ -281,11 +424,14 @@ void tempSensor(void)
         {
             tempAlarmActive = 1;
             alarmSignalOn = 1;
+            settingsModeExit();
             P9OUT &= ~BIT7;
             setAlarmOutputs(1);
         }
 
-        displayTemp();
+        serviceDisplayRequests();
+        if (!settingsModeIsActive())
+            displayTemp();
 
         if (!tempAlarmActive)
         {
@@ -307,9 +453,6 @@ void tempSensorModeInit(void)
     RTC_C_holdClock(RTC_C_BASE); // Stop stopwatch
     RTC_C_holdCounterPrescale(RTC_C_BASE, RTC_C_PRESCALE_0);
 
-    // Check if any button is pressed
-    Timer_A_initUpMode(TIMER_A0_BASE, &initUpParam_A0);
-
     // P1.3/TA1.2 is the hardware PWM output for the passive buzzer.
     GPIO_setAsPeripheralModuleFunctionOutputPin(
         GPIO_PORT_P1,
@@ -318,16 +461,26 @@ void tempSensorModeInit(void)
     TA1CTL = MC__STOP | TACLR;
     TA1CCTL2 = OUTMOD_0;
 
+    initializeTemperatureHistory();
     tempAlarmActive = 0;
     alarmAcknowledgeRequested = 0;
     alarmArmed = 1;
     alarmSignalOn = 0;
+    alarmToneRequested = 0;
+    feedbackToneRequested = 0;
+    buzzerToneOn = 0;
+    TB0CTL = MC__STOP | TBCLR;
+    TB0CCTL0 = 0;
+    updateBuzzerOutput();
     P1OUT &= ~BIT0;
     P9OUT &= ~BIT7;
 }
 
 void displayTemp(void)
 {
+    if (settingsModeIsActive())
+        return;
+
     clearLCD();
 
     // Pick C or F depending on tempUnit state
@@ -364,7 +517,7 @@ void displayTemp(void)
     // Decimal point
     LCDMEM[pos4 + 1] |= 0x01;
 
-    // Degree symbol
+    // The degree symbol is a fixed glass segment between positions 5 and 6.
     LCDMEM[pos5 + 1] |= 0x04;
 
     if (tempAlarmActive)
@@ -378,4 +531,13 @@ __interrupt void TIMER3_A0_ISR(void)
     TA3CCTL0 &= ~CCIE;
     lpm3DelayComplete = 1;
     __bic_SR_register_on_exit(LPM3_bits);
+}
+
+#pragma vector = TIMER0_B0_VECTOR
+__interrupt void TIMER0_B0_ISR(void)
+{
+    TB0CTL = MC__STOP | TBCLR;
+    TB0CCTL0 &= ~CCIE;
+    feedbackToneRequested = 0;
+    updateBuzzerOutput();
 }

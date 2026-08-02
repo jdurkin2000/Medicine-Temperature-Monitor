@@ -13,5 +13,6 @@
     },
     "search.exclude": {
         "**/Debug/.clangd/.cache/**": true
-    }
+    },
+    "extensions.ignoreRecommendations": true
 }

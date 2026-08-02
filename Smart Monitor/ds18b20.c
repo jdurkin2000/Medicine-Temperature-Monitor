@@ -48,21 +48,34 @@ void delay_us(unsigned long microseconds)
 
 void ds18b20_start_conversion(void)
 {
+    unsigned int interruptState = __get_SR_register() & GIE;
+
+    /* One-wire bit slots are timing critical; defer ISRs for this transaction. */
+    __disable_interrupt();
     reset_18B20();
     send_18B20(0xcc);   //send CCH,Skip ROM command
     send_18B20(0x44);
+
+    if (interruptState)
+        __enable_interrupt();
 }
 
 float ds18b20_read_temperature(void)
 {
+    unsigned int interruptState = __get_SR_register() & GIE;
     unsigned int temp;
     int signedTemp;
 
+    /* The conversion itself slept in LPM3; only protect the short bus read. */
+    __disable_interrupt();
     reset_18B20();
     send_18B20(0xcc);   //send CCH,Skip ROM command
     send_18B20(0xbe);
 
     temp = read_18B20();
+
+    if (interruptState)
+        __enable_interrupt();
 
     /*
      * read_18B20() returns the signed DS18B20 value shifted right once.
