@@ -4,7 +4,8 @@ Low-power medicine temperature monitor firmware for the Texas Instruments
 MSP430FR6989 LaunchPad. The current prototype reads an external DS18B20,
 shows the temperature on the LaunchPad's segmented LCD, logs samples in FRAM,
 and raises a visible and audible alarm when the reading leaves a configured
-safe range.
+safe range, three consecutive sensor results fail, or sensor communication
+quality remains below 90% for an hour.
 
 This README is both project documentation and an AI handoff. It describes the
 code as it exists today, including unfinished features and constraints that
@@ -25,7 +26,7 @@ sensitive medicine. It should eventually:
 
 This is still prototype firmware, not a validated medical device. Sampling is
 intentionally frequent, several settings are display-only placeholders, and
-sensor fault handling and production-level testing are not implemented yet.
+production-level testing is not implemented yet.
 
 ## Current behavior
 
@@ -34,10 +35,14 @@ sensor fault handling and production-level testing are not implemented yet.
 1. Start a DS18B20 conversion.
 2. Turn the green LED on for 50 ms, then turn it off.
 3. Sleep in LPM3 for the rest of the sensor's 750 ms conversion window.
-4. Read the sensor, round the result to tenths of a degree Celsius, and append
-   it to the FRAM ring buffer.
-5. Transmit the Fahrenheit value over the UART backchannel.
-6. Update the LCD unless the settings overlay owns it.
+4. Read all nine scratchpad bytes and verify presence and CRC, retrying a
+   failed read up to two more times against the completed conversion.
+5. For a valid read, round to tenths of a degree Celsius, append a valid FRAM
+   entry, and transmit Fahrenheit over the UART backchannel. After three
+   failures, append an invalid entry containing the last known good value and
+   do not transmit a UART temperature; the final failed attempt classifies the
+   result as either a no-presence or CRC-mismatch alarm cause.
+6. Update the LCD unless the settings or alarm-message overlay owns it.
 7. Sleep for an additional one second, then repeat.
 
 The resulting prototype cadence is approximately one sample every 1.75
@@ -50,20 +55,49 @@ conversion.
 
 ### Alarm behavior
 
-The default safe range is inclusive: 2.0 degC through 8.0 degC. A completed
-sample below or above those limits starts the alarm:
+The default safe range is inclusive: 2.0 degC through 8.0 degC. Four
+independent causes can start the shared alarm output path: an out-of-range
+temperature, probe absence, repeated CRC mismatch, or sustained signal
+degradation.
 
 - the green measurement LED stays off;
 - the red LED and passive-buzzer tone pulse for 100 ms;
 - the pulse is followed by 650 ms off;
 - the LCD exclamation icon is enabled;
-- the settings overlay closes so the alarm temperature is visible; and
+- the settings overlay closes and the active alarm cause messages begin
+  scrolling; and
 - sampling repeats as soon as each 750 ms DS18B20 conversion completes.
+
+The LCD continuously cycles through the currently active causes at 200 ms per
+scroll step: `TEMP HI` or `TEMP LO` for the live temperature direction,
+`NO PROBE` for a no-presence result, `BAD CRC` for a presence-confirmed CRC
+mismatch, and `WEAK SIGNAL` for degradation. The active-cause set is refreshed
+at each complete message loop. If every condition clears before the latched
+alarm is acknowledged, the most recent cause cycle remains visible. The
+exclamation icon stays enabled on every scrolling frame.
 
 Pressing either S1 or S2 acknowledges the alarm. That physical press is
 consumed, so it cannot also change a setting or temperature unit. After an
 acknowledgement, the alarm remains disarmed while the temperature is still out
 of range. One later in-range sample rearms it.
+
+Presence and CRC failures are filtered through up to three immediate attempts.
+If conversion never starts, or the final read retry loses presence, the
+no-presence cause activates. If conversion starts and the final failed read is
+a CRC mismatch, the separate CRC cause activates. Mixed read failures are
+classified by the final attempt. The LCD retains the last good numeric
+temperature as stale history; if no good value exists it displays `FAULT`.
+A later successful result clears both communication conditions, with each
+cause retaining its own acknowledgement and rearm state.
+
+The firmware tracks successful and total raw read attempts in 60 one-minute
+RAM buckets. After a complete 60-minute warm-up, a success rate below 90%
+activates a separate signal-degradation cause through the shared latched
+red-LED/buzzer alarm. Exactly 90% is accepted. Acknowledgement uses the same
+consumed-button path for temperature range, no presence, CRC mismatch, and
+signal degradation. Each cause stays disarmed until its own condition clears,
+then rearms independently. The one-hour signal-quality evidence restarts after
+reset.
 
 ### Buttons and settings
 
@@ -87,10 +121,18 @@ intentionally a no-op, and `HSTRY` is the six-character label for `HISTORY`.
 
 ### Temperature history
 
-Every completed reading is stored as signed tenths of a degree Celsius in a
-64-entry FRAM ring buffer. Its magic value, next index, count, and samples
-survive an ordinary reset because `temperatureHistoryLog` uses TI's
-`PERSISTENT` pragma. A firmware download may erase or replace this data.
+Every completed measurement is stored as signed tenths of a degree Celsius in
+a 64-entry FRAM ring buffer. An eight-byte bitmap identifies valid and invalid
+entries. Invalid entries retain the last known good temperature so future UI
+code can show continuity without mistaking the value for a fresh reading.
+The magic value, next index, count, samples, and validity bitmap survive an
+ordinary reset because `temperatureHistoryLog` uses TI's `PERSISTENT` pragma.
+The previous history layout is migrated with its retained entries marked
+valid. A firmware download may still erase or replace this data.
+
+At boot, a recovered last-good temperature is deliberately unconfirmed for
+the new session. It is displayed immediately with `!`; the marker clears only
+after the first fresh, CRC-validated sample completes.
 
 There is not yet a history UI, timestamp, checksum/CRC, export function, or
 out-of-range-duration calculation. The ring buffer type and helper functions
@@ -149,11 +191,14 @@ flowchart TD
     M[main.c initialization] --> T[tempSensor foreground loop]
     T --> C[Start DS18B20 conversion]
     C --> L[TA3-timed LPM3 wait]
-    L --> R[Read and normalize temperature]
-    R --> O[Log FRAM and send UART]
-    O --> A{Inside safe range?}
-    A -->|yes| D[Normal LCD/green indication]
-    A -->|no| X[Alarm state: red LED, buzzer, exclamation]
+    L --> R[Presence and CRC-validated read, up to 3 attempts]
+    R --> V{Valid result?}
+    V -->|yes| O[Log valid FRAM sample and send UART]
+    V -->|no| I[Log invalid FRAM sample and show stale value]
+    O --> A{Range, no-presence, CRC, or degradation alarm?}
+    I --> A
+    A -->|no| D[Normal or stale-value LCD indication]
+    A -->|yes| X[Alarm state: red LED, buzzer, scrolling cause, exclamation]
     D --> T
     X --> T
 
@@ -191,11 +236,11 @@ advance timing state, stop one-shot timers, request display work, and wake the
 foreground loop. Keep slow formatting and multi-character LCD rendering out
 of interrupt handlers.
 
-The settings renderer uses request flags so the temperature loop can service
-it whenever a button interrupt wakes the MCU during an LPM3 delay. One-wire
-reset/read/write transactions briefly disable interrupts because their bit
-slots are timing-sensitive; the 750 ms conversion wait itself remains
-interruptible and uses LPM3.
+The settings and alarm-message renderers use request flags so the temperature
+loop can service them whenever a Timer_A0 or button interrupt wakes the MCU
+during an LPM3 delay. One-wire reset/read/write transactions briefly disable
+interrupts because their bit slots are timing-sensitive; the 750 ms conversion
+wait itself remains interruptible and uses LPM3.
 
 ### Clock and timer ownership
 
@@ -210,7 +255,7 @@ Do not reuse a timer without redesigning all of its existing clients.
 
 | Resource | Clock | Exclusive use |
 | --- | --- | --- |
-| Timer_A0 CCR0 | ACLK | 20 ms button debounce/hold ticks; switches to 200 ms ticks while only the settings intro scroll needs it |
+| Timer_A0 CCR0 | ACLK | 20 ms button debounce/hold ticks; switches to 200 ms ticks while the settings intro or alarm-cause scroll needs it |
 | Timer_A1 CCR0/CCR2 | ACLK | Hardware PWM tone on P1.3 for both alarm and button feedback |
 | Timer_A2 | SMCLK | Busy-wait microsecond timing for the one-wire driver |
 | Timer_A3 CCR0 | ACLK | One-shot LPM3 sleep for conversion, normal interval, and alarm phases |
@@ -249,6 +294,8 @@ These are the main knobs a future task is likely to change:
 | `MEASUREMENT_LED_ON_TICKS` | 1638 | `TempSensorMode.c` | About 50 ms green flash |
 | `ALARM_ON_TICKS` | 3277 | `TempSensorMode.c` | About 100 ms red/tone pulse |
 | `ALARM_OFF_TICKS` | 21299 | `TempSensorMode.c` | About 650 ms between pulses |
+| `DS18B20_MAX_ATTEMPTS` | 3 | `TempSensorMode.c` | Immediate attempts before an invalid sample |
+| `RELIABILITY_BUCKET_COUNT` | 60 | `TempSensorMode.c` | One-minute RAM buckets in the reliability window |
 | `BUTTON_TIMER_INTERVAL_MS` | 20 | `TempSensorMode.h` | Button sampling/debounce period |
 | `BUTTON_LONG_PRESS_MS` | 1000 | `TempSensorMode.h` | Long-press threshold |
 | `BUTTON_RELEASE_DEBOUNCE_MS` | 40 | `TempSensorMode.h` | Stable release time |
@@ -327,8 +374,8 @@ a task explicitly includes redesigning them:
 5. Preserve Timer_A1 tone-request arbitration between alarm and feedback.
 6. One-wire timing-critical transactions may mask interrupts briefly, but the
    sensor conversion delay must remain interruptible.
-7. An alarm acknowledgement consumes the whole button press and remains
-   disarmed until an in-range sample rearms it.
+7. Alarm acknowledgement consumes the whole button press. Each acknowledged
+   alarm cause remains disarmed until its own condition clears.
 8. Store temperatures and thresholds in one canonical fixed-point Celsius
    representation; presentation may use C or F.
 9. Do not modify vendored DriverLib for application behavior.
@@ -344,8 +391,10 @@ a task explicitly includes redesigning them:
 - Thresholds and selected display unit are not persisted as user settings.
 - History has no timestamps, UI, export, integrity check, or duration summary.
 - The DS18B20 driver uses Skip ROM and therefore assumes exactly one sensor.
-- The driver does not verify presence, scratchpad CRC, disconnected-bus data,
-  or conversion completion.
+- The driver does not poll conversion completion; it waits the configured
+  worst-case conversion interval instead.
+- The one-hour sensor-read reliability window is held in RAM and restarts
+  after reset.
 - The driver never writes the DS18B20 resolution configuration. It waits the
   12-bit maximum conversion time but relies on the sensor's existing/default
   configuration.

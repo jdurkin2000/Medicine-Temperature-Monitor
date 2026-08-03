@@ -216,6 +216,30 @@ static void startButtonTimer(void)
 }
 
 /*
+ * TempSensorMode calls this when an alarm scroll begins in foreground code.
+ * Leave an active 20 ms debounce timer untouched; the ISR will select the
+ * 200 ms scroll period after both buttons finish debouncing.
+ */
+void timerA0RequestScrollService(void)
+{
+    unsigned int interruptState = __get_SR_register() & GIE;
+
+    __disable_interrupt();
+    if (!buttonTimerRunning)
+    {
+        buttonTimerRunning = 1;
+        buttonTimerIntervalMs = SETTINGS_SCROLL_STEP_MS;
+        TA0CTL = MC__STOP | TACLR;
+        TA0CCR0 = SETTINGS_SCROLL_TIMER_CCR0;
+        TA0CCTL0 = CCIE;
+        TA0CTL = TASSEL__ACLK | MC__UP | TACLR;
+    }
+
+    if (interruptState)
+        __enable_interrupt();
+}
+
+/*
  * RTC Interrupt Service Routine
  * Wakes up every ~10 milliseconds to update stowatch
  */
@@ -327,6 +351,9 @@ __interrupt void TIMER0_A0_ISR (void)
 {
     unsigned char wakeForeground =
         settingsModeTimerTick(buttonTimerIntervalMs);
+
+    wakeForeground |=
+        tempSensorAlarmDisplayTimerTick(buttonTimerIntervalMs);
 
     if (S1buttonDebounce)
     {
@@ -447,7 +474,8 @@ __interrupt void TIMER0_A0_ISR (void)
 
     if (!S1buttonDebounce && !S2buttonDebounce)
     {
-        if (settingsModeNeedsTimer())
+        if (settingsModeNeedsTimer() ||
+            tempSensorAlarmDisplayNeedsTimer())
         {
             if (buttonTimerIntervalMs != SETTINGS_SCROLL_STEP_MS)
             {

@@ -91,6 +91,10 @@ void tempSensorRequestDisplayRefresh(void);
 unsigned char tempSensorIsAlarmActive(void);
 void tempSensorAcknowledgeAlarm(void);
 void tempSensorStartButtonFeedback(void);
+unsigned char tempSensorAlarmDisplayIsActive(void);
+unsigned char tempSensorAlarmDisplayNeedsTimer(void);
+unsigned char tempSensorAlarmDisplayTimerTick(unsigned int elapsedMs);
+unsigned char tempSensorAlarmDisplayServiceDisplay(void);
 void displayTemp(void);
 
 #endif /* OUTOFBOX_MSP430FR6989_TEMPSENSORMODE_H_ */

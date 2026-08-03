@@ -48,6 +48,9 @@
 #include "debug.h"
 #include "ds18b20.h"
 
+/* main.c owns the shared Timer_A0 hardware and starts it on this request. */
+void timerA0RequestScrollService(void);
+
 volatile unsigned char tempUnit = 0; // Temperature Unit
 volatile int degC;                   // Celsius, in tenths of a degree
 volatile int degF;                   // Fahrenheit, in tenths of a degree
@@ -66,8 +69,20 @@ volatile int16_t temp_alarm_high_tenths_c = 80;
 #define BUZZER_TIMER_PERIOD 15U
 #define BUZZER_TIMER_DUTY 1U
 #define LCD_EXCLAMATION_BIT BIT0
-#define TEMPERATURE_HISTORY_MAGIC 0x544DU
+#define TEMPERATURE_HISTORY_MAGIC_LEGACY 0x544DU
+#define TEMPERATURE_HISTORY_MAGIC 0x544EU
 #define TEMPERATURE_HISTORY_CAPACITY 64U
+#define TEMPERATURE_HISTORY_VALIDITY_BYTES \
+    (TEMPERATURE_HISTORY_CAPACITY / 8U)
+#define DS18B20_MAX_ATTEMPTS 3U
+#define RELIABILITY_BUCKET_COUNT 60U
+#define RELIABILITY_MINUTE_TICKS (ACLK_FREQUENCY_HZ * 60UL)
+#define ALARM_CAUSE_TEMPERATURE BIT0
+#define ALARM_CAUSE_SENSOR_NO_PRESENCE BIT1
+#define ALARM_CAUSE_SENSOR_CRC_MISMATCH BIT2
+#define ALARM_CAUSE_SIGNAL_DEGRADATION BIT3
+#define LCD_CHARACTER_COUNT 6U
+#define ALARM_SCROLL_FIRST_OFFSET 5
 #define BUTTON_FEEDBACK_BEEP_ACLK_TICKS \
     ((ACLK_FREQUENCY_HZ * BUTTON_FEEDBACK_BEEP_MS + 999UL) / 1000UL)
 
@@ -77,7 +92,42 @@ typedef struct
     uint16_t nextIndex;
     uint16_t sampleCount;
     int16_t samplesTenthsC[TEMPERATURE_HISTORY_CAPACITY];
+    uint8_t validityBitmap[TEMPERATURE_HISTORY_VALIDITY_BYTES];
 } TemperatureHistoryLog;
+
+typedef struct
+{
+    uint16_t successfulAttempts;
+    uint16_t totalAttempts;
+} ReliabilityBucket;
+
+typedef enum
+{
+    ALARM_DISPLAY_MESSAGE_TEMP_HI = 0,
+    ALARM_DISPLAY_MESSAGE_TEMP_LO,
+    ALARM_DISPLAY_MESSAGE_NO_PROBE,
+    ALARM_DISPLAY_MESSAGE_BAD_CRC,
+    ALARM_DISPLAY_MESSAGE_WEAK_SIGNAL
+} AlarmDisplayMessage;
+
+static const int lcdPositions[LCD_CHARACTER_COUNT] =
+{
+    pos1, pos2, pos3, pos4, pos5, pos6
+};
+
+static const unsigned char alarmCauseOrder[] =
+{
+    ALARM_CAUSE_TEMPERATURE,
+    ALARM_CAUSE_SENSOR_NO_PRESENCE,
+    ALARM_CAUSE_SENSOR_CRC_MISMATCH,
+    ALARM_CAUSE_SIGNAL_DEGRADATION
+};
+
+static const char alarmTempHighText[] = "TEMP HI";
+static const char alarmTempLowText[] = "TEMP LO";
+static const char alarmNoProbeText[] = "NO PROBE";
+static const char alarmBadCrcText[] = "BAD CRC";
+static const char alarmWeakSignalText[] = "WEAK SIGNAL";
 
 /*
  * PERSISTENT places this ring buffer in writable FRAM without C startup
@@ -93,10 +143,32 @@ static volatile unsigned char displayRefreshRequested;
 static volatile unsigned char alarmAcknowledgeRequested;
 static volatile unsigned char tempAlarmActive;
 static volatile unsigned char feedbackToneRequested;
-static unsigned char alarmArmed = 1;
 static unsigned char alarmSignalOn;
 static volatile unsigned char alarmToneRequested;
 static volatile unsigned char buzzerToneOn;
+static volatile unsigned char currentAlarmConditions;
+static unsigned char acknowledgedAlarmConditions;
+static unsigned char temperatureRangeCondition;
+static unsigned char sensorNoPresenceCondition;
+static unsigned char sensorCrcMismatchCondition;
+static unsigned char signalDegradationCondition;
+static unsigned char currentReadingInvalid;
+static unsigned char hasLastGoodTemperature;
+static int16_t lastGoodTemperatureTenthsC;
+static volatile unsigned char alarmDisplayActive;
+static volatile unsigned char alarmDisplayUpdateRequested;
+static volatile unsigned int alarmDisplayElapsedMs;
+static volatile signed char alarmDisplayOffset;
+static volatile unsigned char alarmDisplayCycleCauses;
+static volatile unsigned char alarmDisplayCause;
+static volatile unsigned char alarmDisplayMessage;
+static volatile unsigned char alarmDisplayMessageLength;
+static ReliabilityBucket reliabilityBuckets[RELIABILITY_BUCKET_COUNT];
+static uint8_t reliabilityCurrentBucket;
+static uint8_t reliabilityElapsedMinutes;
+static uint32_t reliabilityTicksInMinute;
+static uint32_t reliabilitySuccessfulAttempts;
+static uint32_t reliabilityTotalAttempts;
 
 /*
  * MSP430FR6989 erratum PMM32 requires LPM3/4 entry to execute from RAM after
@@ -164,21 +236,375 @@ static void setAlarmOutputs(unsigned char enabled)
     updateBuzzerOutput();
 }
 
+static unsigned char nextAlarmDisplayCause(unsigned char causes,
+                                           unsigned char afterCause)
+{
+    unsigned char index = 0U;
+    const unsigned char causeCount =
+        (unsigned char)(sizeof(alarmCauseOrder) / sizeof(alarmCauseOrder[0]));
+
+    if (afterCause != 0U)
+    {
+        while ((index < causeCount) &&
+               (alarmCauseOrder[index] != afterCause))
+        {
+            index++;
+        }
+
+        if (index < causeCount)
+            index++;
+    }
+
+    while (index < causeCount)
+    {
+        if ((causes & alarmCauseOrder[index]) != 0U)
+            return alarmCauseOrder[index];
+        index++;
+    }
+
+    return 0U;
+}
+
+static void prepareAlarmDisplayMessage(unsigned char cause)
+{
+    switch (cause)
+    {
+        case ALARM_CAUSE_TEMPERATURE:
+            if (degC < temp_alarm_low_tenths_c)
+            {
+                alarmDisplayMessage = ALARM_DISPLAY_MESSAGE_TEMP_LO;
+                alarmDisplayMessageLength =
+                    (unsigned char)(sizeof(alarmTempLowText) - 1U);
+            }
+            else
+            {
+                alarmDisplayMessage = ALARM_DISPLAY_MESSAGE_TEMP_HI;
+                alarmDisplayMessageLength =
+                    (unsigned char)(sizeof(alarmTempHighText) - 1U);
+            }
+            break;
+        case ALARM_CAUSE_SENSOR_NO_PRESENCE:
+            alarmDisplayMessage = ALARM_DISPLAY_MESSAGE_NO_PROBE;
+            alarmDisplayMessageLength =
+                (unsigned char)(sizeof(alarmNoProbeText) - 1U);
+            break;
+        case ALARM_CAUSE_SENSOR_CRC_MISMATCH:
+            alarmDisplayMessage = ALARM_DISPLAY_MESSAGE_BAD_CRC;
+            alarmDisplayMessageLength =
+                (unsigned char)(sizeof(alarmBadCrcText) - 1U);
+            break;
+        case ALARM_CAUSE_SIGNAL_DEGRADATION:
+        default:
+            alarmDisplayMessage = ALARM_DISPLAY_MESSAGE_WEAK_SIGNAL;
+            alarmDisplayMessageLength =
+                (unsigned char)(sizeof(alarmWeakSignalText) - 1U);
+            break;
+    }
+}
+
+static void renderAlarmScrollWindow(const char *text,
+                                    unsigned char textLength,
+                                    signed char offset)
+{
+    char characters[LCD_CHARACTER_COUNT] = {' ', ' ', ' ', ' ', ' ', ' '};
+    unsigned char index = textLength;
+
+    while (index != 0U)
+    {
+        int lcdIndex;
+
+        index--;
+        lcdIndex = (int)offset + (int)index;
+        if ((lcdIndex >= 0) && (lcdIndex < (int)LCD_CHARACTER_COUNT))
+            characters[(unsigned int)lcdIndex] = text[index];
+    }
+
+    clearLCD();
+    index = LCD_CHARACTER_COUNT;
+    while (index != 0U)
+    {
+        index--;
+        showChar(characters[index], lcdPositions[index]);
+    }
+    LCDM3 |= LCD_EXCLAMATION_BIT;
+}
+
+static void startAlarmDisplay(void)
+{
+    unsigned int interruptState = __get_SR_register() & GIE;
+
+    __disable_interrupt();
+    alarmDisplayCycleCauses = currentAlarmConditions;
+    alarmDisplayCause = nextAlarmDisplayCause(alarmDisplayCycleCauses, 0U);
+    prepareAlarmDisplayMessage(alarmDisplayCause);
+    alarmDisplayOffset = ALARM_SCROLL_FIRST_OFFSET;
+    alarmDisplayElapsedMs = 0U;
+    alarmDisplayUpdateRequested = 1U;
+    alarmDisplayActive = 1U;
+    if (interruptState)
+        __enable_interrupt();
+
+    timerA0RequestScrollService();
+}
+
+static void stopAlarmDisplay(void)
+{
+    unsigned int interruptState = __get_SR_register() & GIE;
+
+    __disable_interrupt();
+    alarmDisplayActive = 0U;
+    alarmDisplayUpdateRequested = 0U;
+    alarmDisplayElapsedMs = 0U;
+    if (interruptState)
+        __enable_interrupt();
+}
+
+unsigned char tempSensorAlarmDisplayIsActive(void)
+{
+    return alarmDisplayActive;
+}
+
+unsigned char tempSensorAlarmDisplayNeedsTimer(void)
+{
+    return alarmDisplayActive;
+}
+
+unsigned char tempSensorAlarmDisplayTimerTick(unsigned int elapsedMs)
+{
+    signed char lastOffset;
+    unsigned char nextCause;
+    unsigned char refreshedCauses;
+
+    if (!alarmDisplayActive)
+        return 0U;
+
+    alarmDisplayElapsedMs += elapsedMs;
+    if (alarmDisplayElapsedMs < SETTINGS_SCROLL_STEP_MS)
+        return 0U;
+
+    alarmDisplayElapsedMs -= SETTINGS_SCROLL_STEP_MS;
+    lastOffset = (signed char)(-((signed char)alarmDisplayMessageLength - 1));
+
+    if (alarmDisplayOffset > lastOffset)
+    {
+        alarmDisplayOffset--;
+    }
+    else
+    {
+        nextCause = nextAlarmDisplayCause(alarmDisplayCycleCauses,
+                                         alarmDisplayCause);
+        if (nextCause == 0U)
+        {
+            refreshedCauses = currentAlarmConditions;
+            if (refreshedCauses != 0U)
+                alarmDisplayCycleCauses = refreshedCauses;
+
+            nextCause = nextAlarmDisplayCause(alarmDisplayCycleCauses, 0U);
+        }
+
+        alarmDisplayCause = nextCause;
+        prepareAlarmDisplayMessage(alarmDisplayCause);
+        alarmDisplayOffset = ALARM_SCROLL_FIRST_OFFSET;
+    }
+
+    alarmDisplayUpdateRequested = 1U;
+    return 1U;
+}
+
+unsigned char tempSensorAlarmDisplayServiceDisplay(void)
+{
+    unsigned int interruptState;
+    unsigned char active;
+    unsigned char message;
+    unsigned char messageLength;
+    signed char offset;
+    const char *text;
+
+    /* Claim one pending frame atomically; LCD rendering stays in foreground. */
+    interruptState = __get_SR_register() & GIE;
+    __disable_interrupt();
+    if (!alarmDisplayUpdateRequested)
+    {
+        if (interruptState)
+            __enable_interrupt();
+        return 0U;
+    }
+
+    alarmDisplayUpdateRequested = 0U;
+    active = alarmDisplayActive;
+    message = alarmDisplayMessage;
+    messageLength = alarmDisplayMessageLength;
+    offset = alarmDisplayOffset;
+
+    if (!active)
+    {
+        if (interruptState)
+            __enable_interrupt();
+        return 0U;
+    }
+
+    switch ((AlarmDisplayMessage)message)
+    {
+        case ALARM_DISPLAY_MESSAGE_TEMP_HI:
+            text = alarmTempHighText;
+            break;
+        case ALARM_DISPLAY_MESSAGE_TEMP_LO:
+            text = alarmTempLowText;
+            break;
+        case ALARM_DISPLAY_MESSAGE_NO_PROBE:
+            text = alarmNoProbeText;
+            break;
+        case ALARM_DISPLAY_MESSAGE_BAD_CRC:
+            text = alarmBadCrcText;
+            break;
+        case ALARM_DISPLAY_MESSAGE_WEAK_SIGNAL:
+        default:
+            text = alarmWeakSignalText;
+            break;
+    }
+
+    renderAlarmScrollWindow(text, messageLength, offset);
+
+    if (interruptState)
+        __enable_interrupt();
+    return 1U;
+}
+
+static void activateAlarm(void)
+{
+    if (tempAlarmActive)
+        return;
+
+    tempAlarmActive = 1;
+    alarmSignalOn = 1;
+    settingsModeExit();
+    P9OUT &= ~BIT7;
+    setAlarmOutputs(1);
+    startAlarmDisplay();
+}
+
+static void refreshAlarmConditions(void)
+{
+    unsigned char updatedConditions = 0U;
+    unsigned char unacknowledgedConditions;
+
+    if (temperatureRangeCondition)
+        updatedConditions |= ALARM_CAUSE_TEMPERATURE;
+    if (sensorNoPresenceCondition)
+        updatedConditions |= ALARM_CAUSE_SENSOR_NO_PRESENCE;
+    if (sensorCrcMismatchCondition)
+        updatedConditions |= ALARM_CAUSE_SENSOR_CRC_MISMATCH;
+    if (signalDegradationCondition)
+        updatedConditions |= ALARM_CAUSE_SIGNAL_DEGRADATION;
+
+    /* Timer_A0 may snapshot this byte, so publish the complete mask at once. */
+    currentAlarmConditions = updatedConditions;
+
+    /* A cleared condition rearms that cause for a future assertion. */
+    acknowledgedAlarmConditions &= updatedConditions;
+    unacknowledgedConditions =
+        updatedConditions & (unsigned char)~acknowledgedAlarmConditions;
+
+    if (unacknowledgedConditions != 0U)
+        activateAlarm();
+}
+
+static unsigned char historySampleIsValid(uint16_t index)
+{
+    uint8_t byteIndex = (uint8_t)(index >> 3);
+    uint8_t bitMask = (uint8_t)(1U << (index & 0x07U));
+
+    return (temperatureHistoryLog.validityBitmap[byteIndex] & bitMask) != 0U;
+}
+
+static void setHistorySampleValidity(uint16_t index, unsigned char valid)
+{
+    uint8_t byteIndex = (uint8_t)(index >> 3);
+    uint8_t bitMask = (uint8_t)(1U << (index & 0x07U));
+
+    if (valid)
+        temperatureHistoryLog.validityBitmap[byteIndex] |= bitMask;
+    else
+        temperatureHistoryLog.validityBitmap[byteIndex] &=
+            (uint8_t)~bitMask;
+}
+
+static void clearHistoryValidity(void)
+{
+    uint8_t i;
+
+    for (i = 0U; i < TEMPERATURE_HISTORY_VALIDITY_BYTES; i++)
+        temperatureHistoryLog.validityBitmap[i] = 0U;
+}
+
+static void markRetainedLegacySamplesValid(void)
+{
+    uint16_t index = temperatureHistoryLog.nextIndex;
+    uint16_t remaining = temperatureHistoryLog.sampleCount;
+
+    clearHistoryValidity();
+    while (remaining != 0U)
+    {
+        index = (index == 0U) ?
+                    (TEMPERATURE_HISTORY_CAPACITY - 1U) :
+                    (index - 1U);
+        setHistorySampleValidity(index, 1U);
+        remaining--;
+    }
+}
+
 static void initializeTemperatureHistory(void)
 {
-    if ((temperatureHistoryLog.magic != TEMPERATURE_HISTORY_MAGIC) ||
-        (temperatureHistoryLog.nextIndex >= TEMPERATURE_HISTORY_CAPACITY) ||
-        (temperatureHistoryLog.sampleCount > TEMPERATURE_HISTORY_CAPACITY))
+    unsigned char structureValid =
+        (temperatureHistoryLog.nextIndex < TEMPERATURE_HISTORY_CAPACITY) &&
+        (temperatureHistoryLog.sampleCount <= TEMPERATURE_HISTORY_CAPACITY);
+
+    if ((temperatureHistoryLog.magic == TEMPERATURE_HISTORY_MAGIC_LEGACY) &&
+        structureValid)
     {
-        temperatureHistoryLog.magic = 0;
-        temperatureHistoryLog.nextIndex = 0;
-        temperatureHistoryLog.sampleCount = 0;
+        /* Existing entries predate validity metadata, so migrate as valid. */
+        temperatureHistoryLog.magic = 0U;
+        markRetainedLegacySamplesValid();
+        temperatureHistoryLog.magic = TEMPERATURE_HISTORY_MAGIC;
+    }
+    else if ((temperatureHistoryLog.magic != TEMPERATURE_HISTORY_MAGIC) ||
+             !structureValid)
+    {
+        temperatureHistoryLog.magic = 0U;
+        temperatureHistoryLog.nextIndex = 0U;
+        temperatureHistoryLog.sampleCount = 0U;
+        clearHistoryValidity();
         // Commit the validity marker last so an interrupted init retries.
         temperatureHistoryLog.magic = TEMPERATURE_HISTORY_MAGIC;
     }
 }
 
-static void logTemperatureSample(int16_t temperatureTenthsC)
+static void recoverLastGoodTemperature(void)
+{
+    uint16_t index = temperatureHistoryLog.nextIndex;
+    uint16_t remaining = temperatureHistoryLog.sampleCount;
+
+    hasLastGoodTemperature = 0U;
+    while (remaining != 0U)
+    {
+        index = (index == 0U) ?
+                    (TEMPERATURE_HISTORY_CAPACITY - 1U) :
+                    (index - 1U);
+        if (historySampleIsValid(index))
+        {
+            lastGoodTemperatureTenthsC =
+                temperatureHistoryLog.samplesTenthsC[index];
+            degC = lastGoodTemperatureTenthsC;
+            degF = degC * 9 / 5 + 320;
+            hasLastGoodTemperature = 1U;
+            return;
+        }
+        remaining--;
+    }
+}
+
+static void logTemperatureSample(int16_t temperatureTenthsC,
+                                 unsigned char valid)
 {
     uint16_t writeIndex = temperatureHistoryLog.nextIndex;
     uint16_t followingIndex = writeIndex + 1U;
@@ -187,6 +613,7 @@ static void logTemperatureSample(int16_t temperatureTenthsC)
         followingIndex = 0;
 
     temperatureHistoryLog.samplesTenthsC[writeIndex] = temperatureTenthsC;
+    setHistorySampleValidity(writeIndex, valid);
     // nextIndex is always committed as a valid value, even at ring wrap.
     temperatureHistoryLog.nextIndex = followingIndex;
 
@@ -200,13 +627,14 @@ static unsigned char serviceAlarmAcknowledgement(void)
         return 0;
 
     alarmAcknowledgeRequested = 0;
+    stopAlarmDisplay();
     tempAlarmActive = 0;
 
     /*
-     * Keep the alarm disarmed while the temperature remains out of range.
-     * It rearms after a later measurement returns to the safe range.
+     * Acknowledge every cause that is currently asserted. Each cause rearms
+     * independently after its condition clears.
      */
-    alarmArmed = 0;
+    acknowledgedAlarmConditions |= currentAlarmConditions;
     alarmSignalOn = 0;
     setAlarmOutputs(0);
     settingsModeExit();
@@ -249,12 +677,89 @@ void tempSensorStartButtonFeedback(void)
         __enable_interrupt();
 }
 
+static void evaluateReadingReliability(void)
+{
+    unsigned char unreliable = 0U;
+
+    if ((reliabilityElapsedMinutes >= RELIABILITY_BUCKET_COUNT) &&
+        (reliabilityTotalAttempts != 0UL))
+    {
+        unreliable =
+            (reliabilitySuccessfulAttempts * 10UL) <
+            (reliabilityTotalAttempts * 9UL);
+    }
+
+    signalDegradationCondition = unreliable;
+    refreshAlarmConditions();
+}
+
+static void initializeReadingReliability(void)
+{
+    uint8_t i;
+
+    for (i = 0U; i < RELIABILITY_BUCKET_COUNT; i++)
+    {
+        reliabilityBuckets[i].successfulAttempts = 0U;
+        reliabilityBuckets[i].totalAttempts = 0U;
+    }
+
+    reliabilityCurrentBucket = 0U;
+    reliabilityElapsedMinutes = 0U;
+    reliabilityTicksInMinute = 0UL;
+    reliabilitySuccessfulAttempts = 0UL;
+    reliabilityTotalAttempts = 0UL;
+    signalDegradationCondition = 0U;
+}
+
+static void recordReadAttempt(unsigned char successful)
+{
+    ReliabilityBucket *bucket =
+        &reliabilityBuckets[reliabilityCurrentBucket];
+
+    bucket->totalAttempts++;
+    reliabilityTotalAttempts++;
+    if (successful)
+    {
+        bucket->successfulAttempts++;
+        reliabilitySuccessfulAttempts++;
+    }
+
+    evaluateReadingReliability();
+}
+
+static void advanceReadingReliability(unsigned long elapsedTicks)
+{
+    reliabilityTicksInMinute += elapsedTicks;
+
+    while (reliabilityTicksInMinute >= RELIABILITY_MINUTE_TICKS)
+    {
+        ReliabilityBucket *expiredBucket;
+
+        reliabilityTicksInMinute -= RELIABILITY_MINUTE_TICKS;
+        if (reliabilityElapsedMinutes < RELIABILITY_BUCKET_COUNT)
+            reliabilityElapsedMinutes++;
+
+        reliabilityCurrentBucket++;
+        if (reliabilityCurrentBucket >= RELIABILITY_BUCKET_COUNT)
+            reliabilityCurrentBucket = 0U;
+
+        expiredBucket = &reliabilityBuckets[reliabilityCurrentBucket];
+        reliabilitySuccessfulAttempts -= expiredBucket->successfulAttempts;
+        reliabilityTotalAttempts -= expiredBucket->totalAttempts;
+        expiredBucket->successfulAttempts = 0U;
+        expiredBucket->totalAttempts = 0U;
+    }
+
+    evaluateReadingReliability();
+}
+
 static void serviceDisplayRequests(void)
 {
     unsigned int interruptState;
     unsigned char refreshTemperature;
 
     settingsModeServiceDisplay();
+    tempSensorAlarmDisplayServiceDisplay();
 
     interruptState = __get_SR_register() & GIE;
     __disable_interrupt();
@@ -263,7 +768,8 @@ static void serviceDisplayRequests(void)
     if (interruptState)
         __enable_interrupt();
 
-    if (refreshTemperature && !settingsModeIsActive())
+    if (refreshTemperature && !settingsModeIsActive() &&
+        !tempSensorAlarmDisplayIsActive())
         displayTemp();
 }
 
@@ -320,6 +826,7 @@ static unsigned char sleepForAclkticks(unsigned long ticks)
         TA3CCTL0 = 0;
         TA3CTL = MC__STOP;
         serviceDisplayRequests();
+        advanceReadingReliability(interval);
         ticks -= interval;
     }
 
@@ -358,7 +865,10 @@ void tempSensor(void)
     while (mode == TEMPSENSOR_MODE)
     {
         float temperatureC;
-        unsigned char temperatureInRange;
+        Ds18b20Status sensorStatus = DS18B20_STATUS_NO_PRESENCE;
+        uint8_t attempt;
+        unsigned char conversionStarted = 0U;
+        unsigned char measurementValid = 0U;
 
         serviceAlarmAcknowledgement();
         serviceDisplayRequests();
@@ -374,7 +884,18 @@ void tempSensor(void)
             P9OUT |= BIT7;
         }
 
-        ds18b20_start_conversion();
+        for (attempt = 0U; attempt < DS18B20_MAX_ATTEMPTS; attempt++)
+        {
+            sensorStatus = ds18b20_start_conversion();
+            if (sensorStatus == DS18B20_STATUS_OK)
+            {
+                conversionStarted = 1U;
+                recordReadAttempt(1U);
+                break;
+            }
+
+            recordReadAttempt(0U);
+        }
 
         if (tempAlarmActive)
         {
@@ -384,10 +905,12 @@ void tempSensor(void)
         else
         {
             // Flash briefly, then finish the 750 ms conversion with LED off.
-            sleepForAclkticks(MEASUREMENT_LED_ON_TICKS);
+            if (!sleepForAclkticks(MEASUREMENT_LED_ON_TICKS))
+                continue;
             P9OUT &= ~BIT7;
-            sleepForAclkticks(DS18B20_CONVERSION_TICKS -
-                              MEASUREMENT_LED_ON_TICKS);
+            if (!sleepForAclkticks(DS18B20_CONVERSION_TICKS -
+                                   MEASUREMENT_LED_ON_TICKS))
+                continue;
         }
 
         if (mode != TEMPSENSOR_MODE)
@@ -396,41 +919,62 @@ void tempSensor(void)
         if (serviceAlarmAcknowledgement())
             continue;
 
-        temperatureC = ds18b20_read_temperature();
-
-        // Store both values in tenths of a degree for displayTemp().
-        if (temperatureC >= 0.0f)
-            degC = (int)(temperatureC * 10.0f + 0.5f);
-        else
-            degC = (int)(temperatureC * 10.0f - 0.5f);
-
-        degF = degC * 9 / 5 + 320;
-
-        // Log every completed sample, even while the settings LCD is active.
-        logTemperatureSample((int16_t)degC);
-
-        uartSendFloat(degF / 10.0, 2);
-        uartSendChar('F');
-
-        temperatureInRange =
-            (degC >= temp_alarm_low_tenths_c) &&
-            (degC <= temp_alarm_high_tenths_c);
-
-        if (temperatureInRange)
+        if (conversionStarted)
         {
-            alarmArmed = 1;
+            for (attempt = 0U; attempt < DS18B20_MAX_ATTEMPTS; attempt++)
+            {
+                sensorStatus = ds18b20_read_temperature(&temperatureC);
+                measurementValid = sensorStatus == DS18B20_STATUS_OK;
+                recordReadAttempt(measurementValid);
+                if (measurementValid)
+                    break;
+            }
         }
-        else if (alarmArmed)
+
+        if (measurementValid)
         {
-            tempAlarmActive = 1;
-            alarmSignalOn = 1;
+            // Store both values in tenths of a degree for displayTemp().
+            if (temperatureC >= 0.0f)
+                degC = (int)(temperatureC * 10.0f + 0.5f);
+            else
+                degC = (int)(temperatureC * 10.0f - 0.5f);
+
+            degF = degC * 9 / 5 + 320;
+            lastGoodTemperatureTenthsC = (int16_t)degC;
+            hasLastGoodTemperature = 1U;
+            currentReadingInvalid = 0U;
+            sensorNoPresenceCondition = 0U;
+            sensorCrcMismatchCondition = 0U;
+
+            // Log one validated sample even while settings owns the LCD.
+            logTemperatureSample((int16_t)degC, 1U);
+
+            uartSendFloat(degF / 10.0, 2);
+            uartSendChar('F');
+
+            temperatureRangeCondition =
+                !((degC >= temp_alarm_low_tenths_c) &&
+                  (degC <= temp_alarm_high_tenths_c));
+            refreshAlarmConditions();
+        }
+        else
+        {
+            int16_t retainedTemperature = hasLastGoodTemperature ?
+                                              lastGoodTemperatureTenthsC : 0;
+
+            currentReadingInvalid = 1U;
             settingsModeExit();
-            P9OUT &= ~BIT7;
-            setAlarmOutputs(1);
+            logTemperatureSample(retainedTemperature, 0U);
+            sensorNoPresenceCondition =
+                sensorStatus == DS18B20_STATUS_NO_PRESENCE;
+            sensorCrcMismatchCondition =
+                sensorStatus == DS18B20_STATUS_CRC_MISMATCH;
+            refreshAlarmConditions();
         }
 
         serviceDisplayRequests();
-        if (!settingsModeIsActive())
+        if (!settingsModeIsActive() &&
+            !tempSensorAlarmDisplayIsActive())
             displayTemp();
 
         if (!tempAlarmActive)
@@ -462,13 +1006,31 @@ void tempSensorModeInit(void)
     TA1CCTL2 = OUTMOD_0;
 
     initializeTemperatureHistory();
-    tempAlarmActive = 0;
-    alarmAcknowledgeRequested = 0;
-    alarmArmed = 1;
-    alarmSignalOn = 0;
-    alarmToneRequested = 0;
-    feedbackToneRequested = 0;
-    buzzerToneOn = 0;
+    recoverLastGoodTemperature();
+    tempAlarmActive = 0U;
+    alarmAcknowledgeRequested = 0U;
+    alarmSignalOn = 0U;
+    alarmToneRequested = 0U;
+    feedbackToneRequested = 0U;
+    buzzerToneOn = 0U;
+    currentAlarmConditions = 0U;
+    acknowledgedAlarmConditions = 0U;
+    temperatureRangeCondition = 0U;
+    sensorNoPresenceCondition = 0U;
+    sensorCrcMismatchCondition = 0U;
+    signalDegradationCondition = 0U;
+    currentReadingInvalid = 1U;
+    displayRefreshRequested = hasLastGoodTemperature ? 1U : 0U;
+    alarmDisplayActive = 0U;
+    alarmDisplayUpdateRequested = 0U;
+    alarmDisplayElapsedMs = 0U;
+    alarmDisplayOffset = ALARM_SCROLL_FIRST_OFFSET;
+    alarmDisplayCycleCauses = 0U;
+    alarmDisplayCause = 0U;
+    alarmDisplayMessage = ALARM_DISPLAY_MESSAGE_TEMP_HI;
+    alarmDisplayMessageLength =
+        (unsigned char)(sizeof(alarmTempHighText) - 1U);
+    initializeReadingReliability();
     TB0CTL = MC__STOP | TBCLR;
     TB0CCTL0 = 0;
     updateBuzzerOutput();
@@ -478,10 +1040,21 @@ void tempSensorModeInit(void)
 
 void displayTemp(void)
 {
-    if (settingsModeIsActive())
+    if (settingsModeIsActive() || tempSensorAlarmDisplayIsActive())
         return;
 
     clearLCD();
+
+    if (currentReadingInvalid && !hasLastGoodTemperature)
+    {
+        showChar('F', pos1);
+        showChar('A', pos2);
+        showChar('U', pos3);
+        showChar('L', pos4);
+        showChar('T', pos5);
+        LCDM3 |= LCD_EXCLAMATION_BIT;
+        return;
+    }
 
     // Pick C or F depending on tempUnit state
     int deg;
@@ -520,7 +1093,7 @@ void displayTemp(void)
     // The degree symbol is a fixed glass segment between positions 5 and 6.
     LCDMEM[pos5 + 1] |= 0x04;
 
-    if (tempAlarmActive)
+    if (currentReadingInvalid || tempAlarmActive)
         LCDM3 |= LCD_EXCLAMATION_BIT;
 }
 
