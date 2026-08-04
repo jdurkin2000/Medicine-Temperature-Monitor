@@ -45,7 +45,6 @@
 #include "SettingsMode.h"
 #include "TempSensorMode.h"
 #include "hal_LCD.h"
-#include "debug.h"
 #include "ds18b20.h"
 
 /* main.c owns the shared Timer_A0 hardware and starts it on this request. */
@@ -54,10 +53,10 @@ void timerA0RequestScrollService(void);
 volatile unsigned char tempUnit = 0; // Temperature Unit
 volatile int degC;                   // Celsius, in tenths of a degree
 volatile int degF;                   // Fahrenheit, in tenths of a degree
-volatile int16_t temp_alarm_low_tenths_c = 20;
-volatile int16_t temp_alarm_high_tenths_c = 80;
+volatile int16_t temp_alarm_low_tenths_c = 210;
+volatile int16_t temp_alarm_high_tenths_c = 260;
 
-#define DS18B20_CONVERSION_TICKS 24576UL // 750 ms at 32768 Hz
+#define DS18B20_CONVERSION_TICKS 12288UL // 375 ms at 32768 Hz (11-bit maximum)
 #define MEASUREMENT_LED_ON_TICKS 1638UL  // 50 ms green measurement flash
 #define ALARM_ON_TICKS 3277UL            // 100 ms red LED/buzzer pulse
 #define ALARM_OFF_TICKS 21299UL          // 650 ms between alarm pulses
@@ -900,24 +899,39 @@ void tempSensor(void)
         if (tempAlarmActive)
         {
             if (!waitForAlarmConversion())
+            {
+                ds18b20_power_off();
                 continue;
+            }
         }
         else
         {
-            // Flash briefly, then finish the 750 ms conversion with LED off.
+            // Flash briefly, then finish the 375 ms conversion with LED off.
             if (!sleepForAclkticks(MEASUREMENT_LED_ON_TICKS))
+            {
+                ds18b20_power_off();
                 continue;
+            }
             P9OUT &= ~BIT7;
             if (!sleepForAclkticks(DS18B20_CONVERSION_TICKS -
                                    MEASUREMENT_LED_ON_TICKS))
+            {
+                ds18b20_power_off();
                 continue;
+            }
         }
 
         if (mode != TEMPSENSOR_MODE)
+        {
+            ds18b20_power_off();
             break;
+        }
 
         if (serviceAlarmAcknowledgement())
+        {
+            ds18b20_power_off();
             continue;
+        }
 
         if (conversionStarted)
         {
@@ -930,6 +944,7 @@ void tempSensor(void)
                     break;
             }
         }
+        ds18b20_power_off();
 
         if (measurementValid)
         {
@@ -949,8 +964,8 @@ void tempSensor(void)
             // Log one validated sample even while settings owns the LCD.
             logTemperatureSample((int16_t)degC, 1U);
 
-            uartSendFloat(degF / 10.0, 2);
-            uartSendChar('F');
+            // uartSendFloat(degF / 10.0, 2);
+            // uartSendChar('F');
 
             temperatureRangeCondition =
                 !((degC >= temp_alarm_low_tenths_c) &&
@@ -989,6 +1004,7 @@ void tempSensor(void)
         }
     }
 
+    ds18b20_power_off();
     setAlarmOutputs(0);
 }
 
@@ -996,6 +1012,7 @@ void tempSensorModeInit(void)
 {
     RTC_C_holdClock(RTC_C_BASE); // Stop stopwatch
     RTC_C_holdCounterPrescale(RTC_C_BASE, RTC_C_PRESCALE_0);
+    ds18b20_init();
 
     // P1.3/TA1.2 is the hardware PWM output for the passive buzzer.
     GPIO_setAsPeripheralModuleFunctionOutputPin(

@@ -8,6 +8,10 @@
 #define ONE_WIRE_OUT P1OUT
 #define ONE_WIRE_DIR P1DIR
 
+#define DS18B20_POWER_PIN BIT4
+#define DS18B20_POWER_OUT P8OUT
+#define DS18B20_POWER_DIR P8DIR
+#define DS18B20_POWER_SETTLE_US 1000UL
 #define DS18B20_RESET_LOW_CYCLES 500U
 #define DS18B20_PRESENCE_SAMPLE_CYCLES 70U
 #define DS18B20_RESET_RECOVERY_CYCLES 430U
@@ -16,9 +20,15 @@
 #define DS18B20_READ_REMAINDER_CYCLES 52U
 #define DS18B20_SCRATCHPAD_BYTES 9U
 #define DS18B20_CRC_DATA_BYTES 8U
+#define DS18B20_WRITE_SCRATCHPAD_COMMAND 0x4EU
+#define DS18B20_ALARM_REGISTER_PLACEHOLDER 0x00U
+#define DS18B20_11_BIT_CONFIGURATION 0x5FU
+#define DS18B20_11_BIT_CONVERSION_US 375000UL
 
 static uint8_t read_18B20_byte(void);
 static uint8_t crc8_update(uint8_t crc, uint8_t byte);
+static unsigned char write_11_bit_configuration(void);
+static void ds18b20_power_on(void);
 
 /*
  * Busy-wait for the requested number of microseconds.
@@ -50,10 +60,43 @@ void delay_us(unsigned long microseconds)
     }
 }
 
+void ds18b20_init(void)
+{
+    /* Drive both rails low before enabling the power-control output. */
+    ONE_WIRE_OUT &= ~ONE_WIRE_PIN;
+    ONE_WIRE_DIR |= ONE_WIRE_PIN;
+    DS18B20_POWER_OUT &= ~DS18B20_POWER_PIN;
+    DS18B20_POWER_DIR |= DS18B20_POWER_PIN;
+}
+
+static void ds18b20_power_on(void)
+{
+    /* Release DQ before its pull-up and the sensor receive switched power. */
+    ONE_WIRE_DIR &= ~ONE_WIRE_PIN;
+    DS18B20_POWER_OUT |= DS18B20_POWER_PIN;
+    delay_us(DS18B20_POWER_SETTLE_US);
+}
+
+void ds18b20_power_off(void)
+{
+    /* Prevent DQ from back-powering the sensor before removing its VDD. */
+    ONE_WIRE_OUT &= ~ONE_WIRE_PIN;
+    ONE_WIRE_DIR |= ONE_WIRE_PIN;
+    DS18B20_POWER_OUT &= ~DS18B20_POWER_PIN;
+}
+
 Ds18b20Status ds18b20_start_conversion(void)
 {
     unsigned int interruptState = __get_SR_register() & GIE;
     Ds18b20Status status = DS18B20_STATUS_NO_PRESENCE;
+
+    ds18b20_power_on();
+
+    if (!write_11_bit_configuration())
+    {
+        ds18b20_power_off();
+        return status;
+    }
 
     /* One-wire bit slots are timing critical; defer ISRs for this transaction. */
     __disable_interrupt();
@@ -67,7 +110,37 @@ Ds18b20Status ds18b20_start_conversion(void)
     if (interruptState)
         __enable_interrupt();
 
+    if (status != DS18B20_STATUS_OK)
+        ds18b20_power_off();
+
     return status;
+}
+
+static unsigned char write_11_bit_configuration(void)
+{
+    unsigned int interruptState = __get_SR_register() & GIE;
+    unsigned char configured = 0U;
+
+    /*
+     * TH and TL are unused DS18B20 alarm registers, unrelated to the
+     * firmware's software alarm thresholds. Keep this setting in the volatile
+     * scratchpad so it can be reapplied after future sensor power-gating.
+     */
+    __disable_interrupt();
+    if (reset_18B20())
+    {
+        send_18B20(0xCCU);   // Skip ROM command
+        send_18B20(DS18B20_WRITE_SCRATCHPAD_COMMAND);
+        send_18B20(DS18B20_ALARM_REGISTER_PLACEHOLDER); // TH
+        send_18B20(DS18B20_ALARM_REGISTER_PLACEHOLDER); // TL
+        send_18B20(DS18B20_11_BIT_CONFIGURATION);       // R1=1, R0=0
+        configured = 1U;
+    }
+
+    if (interruptState)
+        __enable_interrupt();
+
+    return configured;
 }
 
 Ds18b20Status ds18b20_read_temperature(float *temperatureC)
@@ -132,9 +205,11 @@ Ds18b20Status get_temp(float *temperatureC)
         return status;
 
     // Blocking compatibility path. Temperature mode uses LPM3 instead.
-    delay_us(750000UL);
+    delay_us(DS18B20_11_BIT_CONVERSION_US);
 
-    return ds18b20_read_temperature(temperatureC);
+    status = ds18b20_read_temperature(temperatureC);
+    ds18b20_power_off();
+    return status;
 }
 
 unsigned char reset_18B20(void)

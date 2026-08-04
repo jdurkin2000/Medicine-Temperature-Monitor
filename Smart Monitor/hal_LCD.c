@@ -96,8 +96,8 @@ void Init_LCD()
 {
     LCD_C_initParam initParams = {0};
     initParams.clockSource = LCD_C_CLOCKSOURCE_ACLK;
-    initParams.clockDivider = LCD_C_CLOCKDIVIDER_1;
-    initParams.clockPrescalar = LCD_C_CLOCKPRESCALAR_16;
+    initParams.clockDivider = LCD_C_CLOCKDIVIDER_4;
+    initParams.clockPrescalar = LCD_C_CLOCKPRESCALAR_32;
     initParams.muxRate = LCD_C_4_MUX;
     initParams.waveforms = LCD_C_LOW_POWER_WAVEFORMS;
     initParams.segments = LCD_C_SEGMENTS_ENABLED;
@@ -120,15 +120,19 @@ void Init_LCD()
                         LCD_C_V5_VSS);
 
     // Set VLCD voltage to 3.20v
-    LCD_C_setVLCDVoltage(LCD_C_BASE,
-                         LCD_C_CHARGEPUMP_VOLTAGE_3_02V_OR_2_52VREF);
+    // LCD_C_setVLCDVoltage(LCD_C_BASE,
+    //                      LCD_C_CHARGEPUMP_VOLTAGE_3_02V_OR_2_52VREF);
 
     // Enable charge pump and select internal reference for it
-    LCD_C_enableChargePump(LCD_C_BASE);
-    LCD_C_selectChargePumpReference(LCD_C_BASE,
-                                    LCD_C_INTERNAL_REFERENCE_VOLTAGE);
+    //LCD_C_enableChargePump(LCD_C_BASE);
+    // LCD_C_selectChargePumpReference(LCD_C_BASE,
+    //                                 LCD_C_INTERNAL_REFERENCE_VOLTAGE);
+    
+    //LCD_C_configChargePump(LCD_C_BASE, LCD_C_SYNCHRONIZATION_ENABLED, 0);
 
-    LCD_C_configChargePump(LCD_C_BASE, LCD_C_SYNCHRONIZATION_ENABLED, 0);
+    LCD_C_setVLCDVoltage(LCD_C_BASE, LCD_C_CHARGEPUMP_DISABLED);
+
+    LCD_C_disableChargePump(LCD_C_BASE);
 
     // Clear LCD memory
     LCD_C_clearMemory(LCD_C_BASE);

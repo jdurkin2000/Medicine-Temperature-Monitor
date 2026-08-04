@@ -54,8 +54,8 @@
  * The short normal delay is convenient for prototyping; the alarm has no
  * extra delay so it samples as quickly as a 12-bit conversion allows.
  */
-#define TEMP_NORMAL_UPDATE_TICKS 32768UL
-#define TEMP_ALARM_UPDATE_TICKS 0UL
+#define TEMP_NORMAL_UPDATE_TICKS 491520UL // 32768UL
+#define TEMP_ALARM_UPDATE_TICKS 32768UL
 
 /*
  * Button timing is based on ACLK so holds continue to advance in LPM3.
@@ -66,10 +66,10 @@
 #define BUTTON_RELEASE_DEBOUNCE_MS 40U
 #define BUTTON_FEEDBACK_BEEP_MS 100U
 
-#define BUTTON_LONG_PRESS_TICKS \
+#define BUTTON_LONG_PRESS_TICKS                               \
     ((BUTTON_LONG_PRESS_MS + BUTTON_TIMER_INTERVAL_MS - 1U) / \
      BUTTON_TIMER_INTERVAL_MS)
-#define BUTTON_RELEASE_DEBOUNCE_TICKS \
+#define BUTTON_RELEASE_DEBOUNCE_TICKS                               \
     ((BUTTON_RELEASE_DEBOUNCE_MS + BUTTON_TIMER_INTERVAL_MS - 1U) / \
      BUTTON_TIMER_INTERVAL_MS)
 
